@@ -22,9 +22,11 @@ including genesis PVP when the owner opens the pad. The manifest contains five a
 | 2 | `PadGame` | none |
 | 3 | `PvPPad` | `$owner`, `$contract:PadToken`, `$contract:PadGame` |
 | 4 | `PadLiquidity` | `0x8366a39cc670b4001a1121b8f6a443a643e40951`, `$contract:PvPPad`, IMD, IMD/ETH PoolKey |
-| 5 | `KingOfThePad` | `$contract:PvPPad`, `$contract:PadLiquidity`, `0x5b95a971b4583a5f011e9da082acdd679b870d06` |
+| 5 | `KingOfThePad` | `$contract:PvPPad`, `$contract:PadLiquidity`, `$owner` (dev) |
 
-Owner and dev are `0x5b95a971b4583a5f011e9da082acdd679b870d06`. Neither the factory nor IMD owns an
+Both `$owner` arguments (PvPPad's owner and KingOfThePad's dev) resolve to the launch owner, which the
+launch names as `0x5b95a971b4583a5f011e9da082acdd679b870d06`; verify the deployed arguments against
+that resolved address. One wallet holds both roles. Neither the factory nor IMD owns an
 application. The owner can open before day 30 and receives 25% of crown extras; there is no pause,
 upgrade, sweep, fee setter or privileged token mint. Anyone can open after day 30.
 
@@ -83,8 +85,10 @@ and later-opening gas and the limits of the factory rehearsal.
    `conversions(game)`, `ConversionProgress`, `ConversionStalled` and `canGraduate(game)`; call
    `graduate()` when ready. A failed attempt does not move the 24-hour no-progress deadline and
    does not use the 30-second interval. The deadline starts when the escrow is created, so the
-   first late touch still tries the venue before any fallback. Watch `anchorOf(game)` against the
-   venue spot: a chunk only fills within ~2% (price) of it.
+   first late touch still tries the venue before any fallback. Watch `PadLiquidity.anchor()` against
+   the venue spot: a chunk only fills within ~2% (price) of it. Every pad touch (roll, entry, poke,
+   launch, king action) refreshes the anchor through upkeep, and anyone may call `observeMarket()`;
+   a pad left untouched for hours lets the anchor decay (0.5% sqrt per hour) before a finalization.
    Upkeep attempts conversion and graduation, but explicit calls remain necessary if gas is scarce.
 
 There are no oracle subscriptions, secret keys, backend signers, additional settings or operator
@@ -152,11 +156,15 @@ draw inside the same transaction cannot capture the remainder. Donations and bai
 
 After finalization, curve ETH is escrowed separately for each game in PadLiquidity. Each
 `convertChunk(game)` uses its own funds in one PoolManager unlock, with a spot-relative limit
-of `sqrtPrice * 0.995` (less than 1% in price), and never below the game's anchor band:
-`0.99 * anchor` in sqrt price (~2% in price), where the anchor is the IMD/ETH spot recorded at
-finalization, raised by any better spot seen at a chunk and decaying by 0.5% sqrt price per hour
-(`anchorOf(game)`). A chunk with spot already below the band is skipped without using the
-interval, so a position held across all chunks cannot walk the game's price. A conversion bigger
+of `sqrtPrice * 0.995` (less than 1% in price), and never below the pad-wide anchor band:
+`0.99 * anchor` in sqrt price (~2% in price), where the anchor is the best IMD/ETH spot observed at
+any pad touch (every roll, entry, poke, launch and king action runs upkeep, which observes the venue;
+finalization and every chunk observe it too), decaying by 0.5% sqrt price per hour
+(`PadLiquidity.anchor()`). Only a higher spot moves the anchor, so a push bundled with a finalize,
+a roll or a chunk is ignored, and a spot read inside a PoolManager unlock is never recorded. A chunk
+with spot already below the band is skipped without using the interval, so a position held across
+all chunks, or taken just before finalization, cannot walk the game's price: it must have been held
+since before the game's last touch, against arbitrage, for the whole game. A conversion bigger
 than ~2% of the venue's depth advances as fast as arbitrage or the decay allows. A chunk can spend only to that limit; remaining
 ETH stays in the game's escrow for the next attempt, at least 30 seconds later. Missing, empty,
 failing or gas-hungry pools leave the escrow intact. A deliberately underfunded call cannot consume
@@ -227,7 +235,7 @@ route, since there is no PVP/IMD pool. Spot-relative limits bound each swap's im
 | Collection health probe | Whole 300k stipend + 100k reserve required |
 | Pad game upkeep step | 4.5M per call; latest entered game plus one older round-robin game |
 | Pad distribute(2) / burnChunk | 750k / 350k |
-| Conversion | 500k upkeep call, 350k isolated swap; 30s/game; 1% from spot and >= 0.99 x anchor (sqrt), anchor decays 0.5%/h (`ANCHOR_BAND_BPS`, `ANCHOR_DECAY_BPS_PER_HOUR`); 24h without 0.1% progress (`PROGRESS_FLOOR_DIVISOR`) or 7 days (`CONVERT_MAX_DURATION`) fallback |
+| Conversion | 500k upkeep call, 350k isolated swap, 80k anchor observation per pad touch (`UPKEEP_OBSERVE_GAS`); 30s/game; 1% from spot and >= 0.99 x pad-wide anchor (sqrt), anchor decays 0.5%/h (`ANCHOR_BAND_BPS`, `ANCHOR_DECAY_BPS_PER_HOUR`); 24h without 0.1% progress (`PROGRESS_FLOOR_DIVISOR`) or 7 days (`CONVERT_MAX_DURATION`) fallback |
 | Pad reserve | 100k plus cap/63 before each subcall; return immediately below 150k |
 | ETH pushes | 30k; rejected push becomes claimable |
 | King funding window | Last 10 entered games; eligibility threshold 5 |

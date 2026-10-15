@@ -21,7 +21,9 @@ The five applications must be deployed atomically in this order, with zero deplo
 | `src/PadLiquidity.sol:PadLiquidity` | `(poolManager, pad, imd, imdEthPoolId)` |
 | `src/KingOfThePad.sol:KingOfThePad` | `(pad, liquidity, dev)` |
 
-Owner and dev: `0x5b95a971b4583a5f011e9da082acdd679b870d06`.
+Owner and dev: both `$owner` in `launch.json`, resolved by the launch to its owner,
+`0x5b95a971b4583a5f011e9da082acdd679b870d06`. Check the deployed `PvPPad.owner()` and
+`KingOfThePad.dev()` against the address the manifest actually resolved.
 Inherited PoolManager: `0x8366a39cc670b4001a1121b8f6a443a643e40951`.
 IMD: `0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127`.
 The venue PoolKey is `(native ETH, IMD, 10000, 100, no hooks)`, with id

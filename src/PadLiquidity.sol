@@ -85,11 +85,8 @@ contract PadLiquidity is IUnlockCallback {
         uint256 imdFees;
     }
 
-    /// @dev anchor: best IMD/ETH sqrt price seen for a game (at finalize and at each chunk), decaying
-    /// linearly from anchorAt. mark: convertedEth at the last lastProgress stamp.
+    /// @dev mark: convertedEth at the last lastProgress stamp.
     struct Guard {
-        uint160 anchor;
-        uint64 anchorAt;
         uint64 startedAt;
         uint256 mark;
     }
@@ -127,6 +124,12 @@ contract PadLiquidity is IUnlockCallback {
     mapping(uint256 => address) public reignKing;
     bool private locked;
     bool private claimLocked;
+    /// @dev Pad-wide anchor: the best IMD/ETH sqrt price seen at any pad touch (every roll, entry, poke,
+    /// launch, king action, finalization and chunk observes it), decaying linearly from anchorAt. Shared
+    /// by every game: a single venue has a single market price, and a position pushed before one
+    /// game's finalization is measured against what every earlier touch recorded.
+    uint160 internal marketAnchor;
+    uint64 internal marketAnchorAt;
 
     Pool[] internal pools;
     mapping(uint256 => uint256) public poolIndexOf; // launchId => index + 1
@@ -233,33 +236,32 @@ contract PadLiquidity is IUnlockCallback {
         emit ConversionStarted(msg.sender, msg.value, block.timestamp + CONVERT_TIMEOUT);
     }
 
-    /// @notice Called by the game at finalization: records the IMD/ETH spot as the conversion anchor
-    /// before anyone knows the chunks are coming. Never reverts for a missing venue.
-    function observe(uint256 launchId) external {
-        _onlyGame(launchId);
-        _anchor(msg.sender, sqrtPriceOf(imdEthKey()));
-    }
-
-    /// @notice The game's anchor now: the best spot seen, minus 0.5% sqrt price per elapsed hour.
-    function anchorOf(address game) public view returns (uint256) {
-        Guard storage g = guards[game];
-        uint256 cut = (block.timestamp - g.anchorAt) * ANCHOR_DECAY_BPS_PER_HOUR;
-        if (cut >= 10_000 * 1 hours) return 0;
-        return uint256(g.anchor) * (10_000 * 1 hours - cut) / (10_000 * 1 hours);
-    }
-
-    function _anchor(address game, uint256 spot) internal returns (uint256 ref) {
-        ref = anchorOf(game);
+    /// @notice Records the IMD/ETH spot into the pad-wide anchor. The pad calls it at every touch
+    /// (PvPPad upkeep, which every finalize path runs) and every chunk does; anyone may call it. Only a higher
+    /// spot moves the anchor up, so a push-down bundled with any of those calls is ignored, and a
+    /// spot read inside a PoolManager unlock (flash-pushed) is not recorded at all. Never reverts for
+    /// a missing venue: an uninitialized pool reads as spot 0.
+    function observeMarket() public returns (uint256 ref) {
+        ref = anchor();
+        if (_managerUnlocked()) return ref;
+        uint256 spot = sqrtPriceOf(imdEthKey());
         if (spot > ref) ref = spot;
-        Guard storage g = guards[game];
-        g.anchor = uint160(ref);
-        g.anchorAt = uint64(block.timestamp);
+        marketAnchor = uint160(ref);
+        marketAnchorAt = uint64(block.timestamp);
+    }
+
+    /// @notice The anchor now: the best spot seen at any pad touch, minus 0.5% sqrt price per elapsed hour.
+    function anchor() public view returns (uint256) {
+        uint256 cut = (block.timestamp - marketAnchorAt) * ANCHOR_DECAY_BPS_PER_HOUR;
+        if (cut >= 10_000 * 1 hours) return 0;
+        return uint256(marketAnchor) * (10_000 * 1 hours - cut) / (10_000 * 1 hours);
     }
 
     /// @notice One ETH -> IMD chunk, at most once per 30 seconds/game, limited to a 1% price move from
-    /// spot and never below the anchor band (2% price under the decaying best spot), so a position held
-    /// across all chunks cannot walk the game's price. A missing/broken/empty/out-of-band pool records
-    /// no progress, does not consume the interval and does not postpone the fallback deadline.
+    /// spot and never below the anchor band (2% price under the decaying best spot seen at any pad
+    /// touch), so a position held across all chunks, or pushed just before finalization, cannot walk
+    /// the game's price. A missing/broken/empty/out-of-band pool records no progress, does not consume
+    /// the interval and does not postpone the fallback deadline.
     function convertChunk(address game) external guard {
         // Inside a PoolManager unlock the venue is unreachable: reject instead of recording an attempt.
         requireManagerLocked();
@@ -272,7 +274,7 @@ contract PadLiquidity is IUnlockCallback {
         // A caller cannot consume the per-game interval with a deliberately underfunded probe.
         if (gasleft() < 350_000 + uint256(350_000) / 63 + 100_000) revert PadErrors.PadConversionGas();
         uint256 spot = sqrtPriceOf(imdEthKey());
-        uint256 ref = _anchor(game, spot);
+        uint256 ref = observeMarket();
         uint256 limit;
         // spot and ref are uint160, so the products fit.
         unchecked {
@@ -400,9 +402,11 @@ contract PadLiquidity is IUnlockCallback {
     /// @notice Reject nested v4 unlocks even when this contract itself is idle.
     /// The slot comes directly from the pinned v4-core Lock library.
     function requireManagerLocked() public view {
-        if (!(IPoolStateReader(address(poolManager)).exttload(Lock.IS_UNLOCKED_SLOT) == bytes32(0))) {
-            revert PadErrors.PadManagerUnlocked();
-        }
+        if (_managerUnlocked()) revert PadErrors.PadManagerUnlocked();
+    }
+
+    function _managerUnlocked() internal view returns (bool) {
+        return IPoolStateReader(address(poolManager)).exttload(Lock.IS_UNLOCKED_SLOT) != bytes32(0);
     }
 
     /// @notice Permissionless round-robin collection. Fees stay in positions before the first crown.

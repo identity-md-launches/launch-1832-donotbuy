@@ -18,7 +18,7 @@ expected = [
     ("PvPPad", ["$owner", "$contract:PadToken", "$contract:PadGame"]),
     ("PadLiquidity", ["0x8366a39cc670b4001a1121b8f6a443a643e40951", "$contract:PvPPad",
                       imd, imd_eth_pool_id]),
-    ("KingOfThePad", ["$contract:PvPPad", "$contract:PadLiquidity", "0x5b95a971b4583a5f011e9da082acdd679b870d06"]),
+    ("KingOfThePad", ["$contract:PvPPad", "$contract:PadLiquidity", "$owner"]),
 ]
 
 

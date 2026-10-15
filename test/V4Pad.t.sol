@@ -63,6 +63,20 @@ contract NestedConverter is IUnlockCallback {
     }
 }
 
+/// @dev Finding 15d57b2a: pushes IMD/ETH down and finalizes the game in the same transaction.
+contract BundledFinalizer {
+    V4Router public immutable router;
+
+    constructor(V4Router r) {
+        router = r;
+    }
+
+    function go(PoolKey memory key, uint256 amount, PadGame game) external {
+        router.trade(key, true, amount);
+        game.finalize();
+    }
+}
+
 contract V4PadTest is BaseTest {
     TestIMD imd;
     PoolKey imdKey;
@@ -840,7 +854,7 @@ contract V4PadTest is BaseTest {
 
     function test_heldFrontRunAcrossAllChunksIsRefusedAndLoses() public {
         _largeRaise();
-        uint256 anchor = liq.anchorOf(address(pvp));
+        uint256 anchor = liq.anchor();
         assertEq(anchor, managerPrice(imdKey), "finalize anchors the spot before any chunk is known");
         V4Router attacker = new V4Router(pm);
         vm.deal(address(attacker), 10 ether);
@@ -859,9 +873,69 @@ contract V4PadTest is BaseTest {
         _assertEscrow();
     }
 
+    function test_frontRunBundledWithFinalizeCannotLowerTheAnchorAndLoses() public {
+        // Twelve wallets roll every 61 s until the game ends on the hard cap; every roll observes the venue.
+        _start(12);
+        for (uint256 r; r < 50 && !pvp.ended(); ++r) {
+            for (uint256 i; i < 12; ++i) {
+                if (!pvp.ended()) rollAs(pvp, players[i]);
+            }
+            advance(61);
+        }
+        vm.warp(pvp.endTime() + 1);
+        arb.advance(300);
+        while (pvp.pendingCount() != 0) pvp.resolvePending(16);
+        assertFalse(pvp.finalized());
+        assertGt(pvp.ethRaised(), 0.75 ether, "escrow large enough for the front-run to pay on its own");
+        uint256 fair = managerPrice(imdKey);
+        uint256 before = liq.anchor();
+        assertGe(before, fair - fair * 10 / 10_000, "play kept the anchor within 0.1% of the fair spot");
+        assertLe(before, fair);
+        // One transaction: 10 ETH -> IMD on the production key, then finalize().
+        V4Router attacker = new V4Router(pm);
+        vm.deal(address(attacker), 10 ether);
+        BundledFinalizer bundle = new BundledFinalizer(attacker);
+        bundle.go(imdKey, 10 ether, pvp);
+        assertTrue(pvp.finalized());
+        assertLt(managerPrice(imdKey), before - before * 1000 / 10_000, "the push moved the spot by over 10%");
+        assertEq(liq.anchor(), before, "a push bundled with finalize does not lower the anchor");
+        // The attacker drives every chunk itself for 100 minutes: all refused, interval untouched.
+        assertEq(_sumConverted(200), 0, "no chunk sells into the attacker's price");
+        (,,, uint64 attempted,,,) = liq.conversions(address(pvp));
+        assertEq(attempted, 0);
+        attacker.trade(imdKey, false, imd.balanceOf(address(attacker)));
+        assertLt(address(attacker).balance, 10 ether, "the bundled front-run only paid both venue fees");
+        // Nobody arbitrages the price back here, so the ~1 ETH escrow drains at the band's pace.
+        assertEq(_sumConverted(600), pvp.ethRaised(), "the conversion completes once the push is unwound");
+        (, uint256 converted, uint256 received,,,,) = liq.conversions(address(pvp));
+        assertGt(received, converted * 95 / 100, "IMD received at roughly the pre-attack price, not -24.5%");
+        _assertEscrow();
+    }
+
+    function test_observationOnlyRaisesTheAnchorAndEveryTouchRefreshesIt() public {
+        _start(12);
+        uint256 a = liq.anchor();
+        // Entries observed the opening spot; the ten-minute signup since then decayed it by ~0.08%.
+        assertApproxEqRel(a, managerPrice(imdKey), 1e15, "entries observed the opening spot");
+        assertLt(a, managerPrice(imdKey));
+        // A genuine rise is recorded by the next touch; a fall is not.
+        router.trade(imdKey, false, 2 ether);
+        uint256 up = managerPrice(imdKey);
+        rollAs(pvp, players[0]);
+        assertEq(liq.anchor(), up, "a roll records a higher spot");
+        router.trade(imdKey, true, 4 ether);
+        advance(61);
+        rollAs(pvp, players[1]);
+        assertApproxEqRel(liq.anchor(), up, 2e14, "a lower spot leaves the anchor to its decay");
+        assertGt(liq.anchor(), managerPrice(imdKey));
+        // Anyone may observe; the anchor still never follows a lower spot.
+        liq.observeMarket();
+        assertGt(liq.anchor(), managerPrice(imdKey));
+    }
+
     function test_anchorBandBoundsCumulativeWalkAndDecaysForAGenuineMove() public {
         _largeRaise();
-        uint256 a = liq.anchorOf(address(pvp));
+        uint256 a = liq.anchor();
         // A lasting market move of ~3% in price (1.5% sqrt) below the anchor, with no arbitrage back.
         router.trade(imdKey, true, 1.03 ether);
         assertLt(managerPrice(imdKey), a - a * 100 / 10_000);
@@ -870,13 +944,13 @@ contract V4PadTest is BaseTest {
         assertEq(converted, 0, "outside the 2% band");
         // The anchor follows a falling market by 0.5% sqrt price per hour.
         vm.warp(vm.getBlockTimestamp() + 1 hours);
-        assertApproxEqAbs(liq.anchorOf(address(pvp)), a - a * 50 / 10_000, 1);
+        assertApproxEqAbs(liq.anchor(), a - a * 50 / 10_000, 1);
         vm.warp(vm.getBlockTimestamp() + 1 hours);
         uint256 spot = managerPrice(imdKey);
         liq.convertChunk(address(pvp));
         (, converted,,,,,) = liq.conversions(address(pvp));
         assertGt(converted, 0, "after the decay the band reaches the new market");
-        uint256 floor = liq.anchorOf(address(pvp));
+        uint256 floor = liq.anchor();
         floor -= floor * 100 / 10_000;
         assertGe(managerPrice(imdKey), floor, "never below the band");
         assertGe(managerPrice(imdKey), spot - spot * 50 / 10_000, "never more than 1% from spot");

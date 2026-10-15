@@ -23,7 +23,7 @@ independent audit. Tests require no network, RPC, fork, environment reads, FFI o
 | Coverage | Tests | Evidence |
 |---|---:|---|
 | All inherited v3 suites | 193 | Raffle, seed bounty, resolver tips/expiry, ranking/bell/death, 200-seat settlement, carry release, crown ordering and gas caps, in-kind fees, reign stamps, broken-pool retries, entry/roll upkeep isolation, claims/reentrancy, deployment and invariant campaigns |
-| `V4PadTest` | 24 | Bail profit/loss/minOut rollback; erasure of rank/bell/living/funding eligibility; timely pending tips; croaked wallets; all-erased end clock; rejected payments; actual sell-out then bail and buy; funded sybil economics; ETH/token conservation; real IMD/ETH limits, partial fills, interval, gas floor, per-game escrow isolation and donation isolation; exact initial price equivalence, token unlock, both currency orders; partial timeout; zero-liquidity no-progress timeout; bounded upkeep; two-hop burn and intermediate balances; IMD/coin fees across crown transitions; constructor/access failures, including changed PoolId fields and IMD/key mismatch; large raw-token price ratios |
+| `V4PadTest` | 34 | Bail profit/loss/minOut rollback; front-run bundled with its own finalize cannot lower the pad-wide anchor and loses; observation only raises the anchor and every touch refreshes it; erasure of rank/bell/living/funding eligibility; timely pending tips; croaked wallets; all-erased end clock; rejected payments; actual sell-out then bail and buy; funded sybil economics; ETH/token conservation; real IMD/ETH limits, partial fills, interval, gas floor, per-game escrow isolation and donation isolation; exact initial price equivalence, token unlock, both currency orders; partial timeout; zero-liquidity no-progress timeout; bounded upkeep; two-hop burn and intermediate balances; IMD/coin fees across crown transitions; constructor/access failures, including changed PoolId fields and IMD/key mismatch; large raw-token price ratios |
 | `V4FallbackTest` | 2 | Uninitialized real venue, exact 24-hour native fallback, continued v3 burn; native genesis followed by an IMD graduation, with rounding remainder collected as fees instead of stranded |
 
 The two new fuzz tests run 64 cases each: bail sequences independently reconcile ETH and supply,
@@ -55,18 +55,36 @@ caller inside a PoolManager unlock is rejected and the honest chunk converts; a 
 attempt does not use the interval; dust fills do not refresh the stall clock; real progress above
 the 0.1% floor refreshes it and the 7-day cap bounds it; an untouched game starts its clock on
 first touch and graduates into coin/IMD; a no-return IMD still settles graduation and the two-hop
-burn. The four reviewer proofs pass unchanged. Full run: 26 suites, 231 tests, 0 failed (the
-count includes the four proofs run from test/scratch), fuzz seed pinned in foundry.toml.
+burn. The four reviewer proofs pass unchanged.
+
+## Revision 2 (finding 15d57b2a, self-finalizing front-run)
+
+Reproduced first on the real PoolManager with the production key (price 1, 68e18 full-range
+liquidity): twelve wallets, twenty rounds of rolls, game ended and resolved, then one transaction
+swapping 5 or 10 ETH -> IMD and calling `finalize()`. Before the fix the anchor equalled the pushed
+spot (sqrt 0.873 of 2^96 for 10 ETH) and the 0.432 ETH escrow converted into 0.369 IMD, 15% below
+the fair price (the attacker's own result at that escrow size was a small loss; the reviewer's
+figures at a 0.8 ETH escrow are theirs). After the fix the same transactions leave the anchor at
+the fair spot decayed by the ten minutes since the last roll (sqrt 0.99917 of 2^96), every chunk
+is refused, and the attacker ends with 9.813 ETH (10 ETH position) or 4.904 ETH (5 ETH position).
+New tests in `test/V4Pad.t.sol`: `test_frontRunBundledWithFinalizeCannotLowerTheAnchorAndLoses`
+(rolls to the hard end, escrow above 0.75 ETH, 10 ETH push bundled with finalize: anchor
+unchanged, zero chunks fill, attacker below 10 ETH, conversion completes within 5% of the fair
+price with no arbitrage back) and `test_observationOnlyRaisesTheAnchorAndEveryTouchRefreshesIt`.
+Deployment gas after the change: 12,188,384 manifest, 12,962,770 with the later `openPad`, under
+the 13M target with 37k to spare; the redundant finalize-time observation was removed to keep it
+there. Full run: 22 suites, 229 tests, 0 failed, fuzz seed pinned in foundry.toml and also run
+with the verifier's `FOUNDRY_FUZZ_SEED`.
 
 ## Gas measurements
 
 | Operation | Local gas |
 |---|---:|
-| Atomic raw-CREATE2 manifest, including calldata/intrinsic and probe accounting overhead | **12,189,237** |
+| Atomic raw-CREATE2 manifest, including calldata/intrinsic and probe accounting overhead | **12,188,384** |
 | Later `openPad`, including hook and genesis clones, calldata/intrinsic | **774,386** |
-| Combined deployment and later opening | **12,963,623** |
-| Conversion upkeep on a partially filled game | 502,982 |
-| Direct two-hop burn, thin PVP pool | 284,553 |
+| Combined deployment and later opening | **12,962,770** |
+| Conversion upkeep on a partially filled game | 458,150 |
+| Direct two-hop burn, thin PVP pool | 267,453 |
 | Crown transition, 16 real pools, both currencies, outgoing king exhausts ETH pushes | 4,795,428 |
 | Crown transition, 18 real pools | 2,829,928 |
 | Crown transition, 60 real pools fully settled | 7,804,512 |
@@ -96,12 +114,12 @@ subcall and a pre-attempt gas floor; burn retains its 350k upkeep stipend. Direc
 | Application | Initcode bytes, excluding constructor words | Runtime bytes | Static words |
 |---|---:|---:|---:|
 | PadToken | 3,044 | 2,999 | 0 |
-| PadGame | 19,977 | 19,936 | 0 |
-| PvPPad | 11,613 | 11,233 | 3 |
-| PadLiquidity | 18,152 | 17,554 | 4 |
+| PadGame | 19,282 | 19,241 | 0 |
+| PvPPad | 11,668 | 11,288 | 3 |
+| PadLiquidity | 18,642 | 18,044 | 4 |
 | KingOfThePad | 3,311 | 2,829 | 3 |
 
-Total runtime is **54,551 bytes**, or **10,910,200** code-deposit gas. Each runtime is below
+Total runtime is **54,401 bytes**, or **10,880,200** code-deposit gas. Each runtime is below
 24,576 bytes and each initcode plus arguments is below 49,152 bytes. The manifest validator and
 runtime scan find no linked libraries or forbidden application escape opcodes. All constructors
 succeed without code at either external dependency address, and create no token supply, name,

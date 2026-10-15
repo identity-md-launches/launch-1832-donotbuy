@@ -15,7 +15,7 @@ broadcast, RPC, fork, wallet, environment-reading test, or outside constructor c
 
 | Who | Power | Notes |
 |-----|-------|-------|
-| Owner / dev (`0x5b95…0d06`) | `openPad(salt)` before day 30; receives 25% of king extras | Cannot pause, upgrade, sweep, mint or change fees. After 30 days anyone can open. |
+| Owner / dev (both `$owner`, the launch owner `0x5b95…0d06`) | `openPad(salt)` before day 30; receives 25% of king extras | Cannot pause, upgrade, sweep, mint or change fees. After 30 days anyone can open. |
 | Anyone | enter, draw, resolvePending, roll, bailOut, prepareConversion, convertChunk, poke, finalize, graduate, launch (after PvP), restartGenesis, takeCrown, distribute, retryPool, burnChunk, fundCarry, claim | Funded donations and pool recovery are permissionless. Lifecycle work is bounded. |
 | PvPPad (contract) | only caller of `PadGame.fundPot` | King share during play; unused carry allowance at finalization. Anyone can donate via `PvPPad.fundCarry`. |
 | Factory / IMD | none | No `msg.sender` / `tx.origin` ownership anywhere. |
@@ -383,20 +383,42 @@ broadcast, RPC, fork, wallet, environment-reading test, or outside constructor c
 
 37. **Revision: conversion anchor, stall clock and dust (findings f2032eaa, d74f26e2, 0183622a,
     ff0950e5, 1c54845c).**
-    - *Held front-run / dominant LP.* The 1% band was relative to a spot the caller can set. Now
-      `_finalize` calls `PadLiquidity.observe(launchId)` (registered game only, gas-capped, a dead
-      venue does not block finalization) to record the IMD/ETH spot as the game's anchor before the
-      chunks are scheduled. Each chunk's limit is `max(0.995 * spot, 0.99 * anchor)` in sqrt price;
-      if spot is already below it the chunk is skipped (`ConversionStalled`, no interval used). The
-      anchor rises to any higher spot seen at a chunk (that chunk then sells at the better price)
-      and decays linearly by 0.5% sqrt per hour so a genuine market move is followed within hours.
-      `anchorOf(game)` is the view. Residual risk: whoever front-runs `finalize` itself sets the
-      anchor and must then hold the position against arbitrage for the whole conversion; a
-      conversion larger than ~2% of the venue's depth progresses only as fast as arbitrage or the
-      decay allows, and the game's cumulative impact is bounded by 2% plus elapsed decay.
-      Raising the anchor costs the griefer both venue fees and sells the game IMD cheaply; it delays
-      chunks only by the decay time. Tested: `test_heldFrontRunAcrossAllChunksIsRefusedAndLoses`,
-      `test_anchorBandBoundsCumulativeWalkAndDecaysForAGenuineMove`, the sandwich fuzz.
+    - *Held front-run / dominant LP.* The 1% band was relative to a spot the caller can set. Each
+      chunk's limit is `max(0.995 * spot, 0.99 * anchor)` in sqrt price; if spot is already below it
+      the chunk is skipped (`ConversionStalled`, no interval used). The anchor is pad-wide
+      (`PadLiquidity.anchor()`): the best IMD/ETH spot observed at any pad touch, decaying linearly
+      by 0.5% sqrt per hour so a genuine market move is followed within hours. `observeMarket()`
+      runs in `PvPPad._upkeep` (every roll, entry, poke, launch and king action), in `_finalize`
+      (gas-capped; a dead venue does not block finalization), in every chunk, and may be called by
+      anyone. Only a higher spot moves it, and a spot read while the PoolManager is unlocked is not
+      recorded. Tested: `test_heldFrontRunAcrossAllChunksIsRefusedAndLoses`,
+      `test_anchorBandBoundsCumulativeWalkAndDecaysForAGenuineMove`,
+      `test_observationOnlyRaisesTheAnchorAndEveryTouchRefreshesIt`, the sandwich fuzz.
+    - *Self-finalizing front-run (finding 15d57b2a).* The first revision anchored at `finalize`
+      only. `finalize()` is permissionless and callable at a computable time, so an attacker bundled
+      a 10 ETH ETH -> IMD swap with its own `finalize()`, anchored the pushed spot, drove the chunks
+      and sold back. The reviewer measured the game receiving 24.5% less IMD and the attacker
+      netting ~0.002 ETH on a 0.8 ETH escrow; reproduced here before the fix on the real
+      PoolManager with a 0.432 ETH escrow: anchor equal to the pushed spot and 15% less IMD for
+      the game (the attacker's own result was a small loss at that size). Now the anchor the
+      finalization inherits was set by every touch of the whole game (a roll every minute in the
+      reproduction), so the bundled push is ignored and every chunk is refused until the attacker
+      unwinds; the position would have to be held since before the game's last touch, against
+      arbitrage, to lower the anchor. `_finalize` no longer observes itself: every path to it
+      (`finalize`, `poke`, `upkeepStep`) runs the pad upkeep that does. Tested:
+      `test_frontRunBundledWithFinalizeCannotLowerTheAnchorAndLoses` (12 wallets roll to the hard
+      end, >0.75 ETH escrow, 10 ETH push bundled with finalize: anchor unchanged, zero chunks fill,
+      attacker ends below 10 ETH, conversion later completes within 3% of the fair price).
+      Residual risk, stated as a bound: the anchor decays 0.5% sqrt per hour from the last touch,
+      so a game whose pad stays untouched for T hours before someone finalizes it lets a
+      self-finalizing front-runner move the effective anchor down by 0.5% * T in sqrt price (about
+      1% * T in price) plus the 2% band; prompt finalization (the finalizer fee), any other game's
+      activity and a public `observeMarket()` call all close that window. The same decay means a
+      genuine IMD/ETH drop larger than the elapsed decay during play stalls the game's conversion
+      until the decay catches up, and a drop of more than ~24% in price within a day sends the game
+      to the 24-hour fallback (partial IMD or the v3 native pool); this is preferred to converting
+      into a manipulated price. Raising the anchor costs the griefer both venue fees and sells the
+      game IMD cheaply; it delays chunks only by the decay time.
     - *Nested unlock.* See 32. Tested: `test_nestedUnlockCallerIsRejectedAndHonestChunkConverts`,
       `test_failedVenueAttemptDoesNotConsumeInterval`.
     - *Dust progress.* A fill refreshes `lastProgress` only when the ETH converted since the last

@@ -18,6 +18,7 @@ contract PvPPad {
     uint256 internal constant UPKEEP_STEP_GAS = 4_500_000;
     uint256 internal constant UPKEEP_DISTRIBUTE_GAS = 750_000;
     uint256 internal constant UPKEEP_BURN_GAS = 350_000;
+    uint256 internal constant UPKEEP_OBSERVE_GAS = 80_000;
     uint256 internal constant UPKEEP_RESERVE_GAS = 100_000;
     string internal constant GENESIS_NAME = "Pepes Value Pepes";
     string internal constant GENESIS_TICKER = "PVP";
@@ -222,8 +223,9 @@ contract PvPPad {
     }
 
     // ---- upkeep ----------------------------------------------------------------------------------
-    /// @notice Bounded upkeep: the latest entered game, one older entered game (round-robin), two
-    /// pools, one burn chunk. Launches without an entry have nothing to tend.
+    /// @notice Bounded upkeep: one IMD/ETH spot observation for the conversion anchor, the latest
+    /// entered game, one older entered game (round-robin), two pools, one burn chunk. Launches
+    /// without an entry have nothing to tend.
     function upkeep() public {
         _upkeep(msg.sender);
     }
@@ -238,6 +240,10 @@ contract PvPPad {
     function _upkeep(address caller) internal {
         if (locked || gasleft() < UPKEEP_RESERVE_GAS + 50_000) return;
         locked = true;
+        // Every pad touch records the venue spot, so the conversion anchor a finalization uses was
+        // set by the whole game's activity, not by whoever finalizes. Capped; the reserve check
+        // above leaves room for it, and later steps re-check their own budgets.
+        try IPadLiquidity(liquidity).observeMarket{gas: UPKEEP_OBSERVE_GAS}() {} catch {}
         uint256 n = entered.length;
         if (n != 0) {
             _tend(launches[entered[n - 1] - 1].game, caller);

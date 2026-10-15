@@ -664,10 +664,9 @@ contract PadGame {
         }
         finalized = true;
         finalizedAt = uint64(block.timestamp);
-        // Anchor the conversion price before the chunks become predictable; a dead venue is no blocker.
-        if (ethRaised != 0) {
-            try IPadLiquidity(liquidity).observe{gas: 80_000}(launchId) {} catch {}
-        }
+        // The conversion anchor is pad-wide and refreshed by the pad upkeep every path to this
+        // function runs (finalize, poke, upkeepStep); only a higher spot moves it, so a push bundled
+        // with this finalization is ignored.
         uint256 p = pot;
         uint256 funded = fundedPot;
         uint256 earned = p - funded - bailPot;
