@@ -49,6 +49,10 @@ contract V4Handler is Test {
     mapping(address => bool) public ghostGraduated;
     mapping(address => bool) public ghostClosed;
     mapping(address => uint256) public ghostLastProgress;
+    mapping(address => uint256) public ghostEscrowAt; // game => block.timestamp the escrow was created
+    mapping(address => uint256) public ghostMark; // game => convertedEth at the last stall-clock stamp
+    mapping(address => uint256) public ghostConverted; // game => last convertedEth seen
+    uint256 public bandStalls;
 
     constructor(PvPPad pad_, PadLiquidity liq_, KingOfThePad king_, MockArbSys arb_, IPoolManager pm_, TestIMD imd_) {
         pad = pad_;
@@ -200,14 +204,28 @@ contract V4Handler is Test {
     // ---- conversion and graduation ------------------------------------------------------------------
     function convertChunk(uint256 a, uint256 g) external {
         PadGame game = _game(g);
-        (uint256 remaining, uint256 converted, uint256 received, uint64 attempted,, bool started, bool closed) =
-            liq.conversions(address(game));
+        (
+            uint256 remaining,
+            uint256 converted,
+            uint256 received,
+            uint64 attempted,
+            uint64 progress,
+            bool started,
+            bool closed
+        ) = liq.conversions(address(game));
         uint256 spot = _spot(imdKey);
         bool intervalOpen = attempted == 0 || vm.getBlockTimestamp() >= uint256(attempted) + 30;
         bool open = started && !closed && remaining != 0;
+        // The chunk's floor: 1% sqrt under spot, but never under the anchor band (1% sqrt under the
+        // decaying best spot). A spot already at or under that floor must stall without side effects.
+        uint256 anchor = liq.anchorOf(address(game));
+        uint256 ref = anchor > spot ? anchor : spot;
+        uint256 limit = spot - spot * 50 / 10_000;
+        if (ref - ref * 100 / 10_000 > limit) limit = ref - ref * 100 / 10_000;
+        bool banded = spot == 0 || limit >= spot;
         vm.prank(_actor(a));
         try liq.convertChunk(address(game)) {
-            (uint256 r2, uint256 c2, uint256 i2,,, bool s2,) = liq.conversions(address(game));
+            (uint256 r2, uint256 c2, uint256 i2, uint64 a2, uint64 p2, bool s2,) = liq.conversions(address(game));
             _check(s2, "chunk on an unstarted conversion");
             if (!open) {
                 // only a game whose conversion was prepared by this very call can succeed here
@@ -216,15 +234,33 @@ contract V4Handler is Test {
                 _check(intervalOpen, "chunk inside the 30 s interval");
             }
             _check(r2 + c2 == (started ? remaining + converted : game.ethRaised()), "escrow ledger not conserved");
+            if (banded) {
+                bandStalls += 1;
+                _check(c2 == converted, "progress from a spot under the anchor band");
+                _check(_spot(imdKey) == spot, "a banded stall touched the venue");
+                if (started) _check(a2 == attempted, "a banded stall consumed the interval");
+            }
             if (c2 > converted) {
                 chunksWithProgress += 1;
                 _check(i2 > received, "progress without IMD");
                 uint256 newSpot = _spot(imdKey);
                 _check(newSpot >= spot - spot * 50 / 10_000, "chunk moved the venue below the 1% limit");
+                _check(newSpot >= limit, "chunk moved the venue below the anchor band");
                 _check(newSpot <= spot, "ETH -> IMD chunk raised the sqrt price");
+                _check(liq.anchorOf(address(game)) >= ref, "a chunk lowered the anchor");
                 ghostLastProgress[address(game)] = vm.getBlockTimestamp();
             } else {
                 _check(i2 == received, "IMD credited without ETH spent");
+            }
+            if (started) {
+                // The stall clock moves only on real progress: at least 0.1% of the escrow since the last
+                // stamp, or completion. Dust can neither refresh it nor can real progress fail to.
+                bool real = c2 > converted && (r2 == 0 || (c2 - ghostMark[address(game)]) * 1000 >= r2 + c2);
+                if (real) {
+                    _check(p2 == uint64(vm.getBlockTimestamp()), "real progress did not refresh the stall clock");
+                } else {
+                    _check(p2 == progress, "dust or no progress refreshed the stall clock");
+                }
             }
         } catch {
             _check(!(open && intervalOpen), "open conversion with free interval refused a chunk");
@@ -238,14 +274,17 @@ contract V4Handler is Test {
             (uint256 remaining,,,,, bool started, bool closed) = liq.conversions(address(game));
             if (started && (closed || remaining == 0)) break;
             try liq.convertChunk(address(game)) {} catch {}
-            (uint256 after_,,,,,,) = liq.conversions(address(game));
-            if (after_ == remaining && started) {
-                // the venue is not moving this game forward; let time pass towards the fallback
-                vm.warp(vm.getBlockTimestamp() + 30);
-            } else {
-                vm.warp(vm.getBlockTimestamp() + 30);
-            }
+            _after(); // keep the escrow and stall-clock ghosts in step before time moves on
+            vm.warp(vm.getBlockTimestamp() + 30);
         }
+        _after();
+    }
+
+    /// @dev Long jumps reach the 24-hour stall fallback and the 7-day cap inside a sequence.
+    function warpDay(uint256 secs) external {
+        secs = bound(secs, 1 hours, 3 days);
+        vm.warp(vm.getBlockTimestamp() + secs);
+        arb.advance(300);
         _after();
     }
 
@@ -412,12 +451,30 @@ contract V4Handler is Test {
             PadGame game = PadGame(pad.gameOf(i));
             address ga = address(game);
             (uint256 remaining, uint256 converted,,, uint64 progress, bool started, bool closed) = liq.conversions(ga);
-            if (started && ghostEscrow[ga] == 0) ghostEscrow[ga] = remaining + converted;
+            if (started && ghostEscrow[ga] == 0) {
+                // the escrow was created inside this call: its clock starts now
+                ghostEscrow[ga] = remaining + converted;
+                ghostEscrowAt[ga] = vm.getBlockTimestamp();
+            }
+            if (started && converted > ghostConverted[ga]) {
+                // at most one fill per game per call (30 s interval); the stamp mark moves when the fill
+                // since the last mark clears 0.1% of the escrow or completes it
+                if (remaining == 0 || (converted - ghostMark[ga]) * 1000 >= remaining + converted) {
+                    ghostMark[ga] = converted;
+                }
+                ghostConverted[ga] = converted;
+            }
             if (ghostGraduated[ga]) _check(game.graduated(), "graduation reopened");
             else ghostGraduated[ga] = game.graduated();
             if (ghostClosed[ga]) _check(closed, "closed conversion reopened");
             else ghostClosed[ga] = closed;
             if (started) _check(progress >= game.finalizedAt(), "progress stamp before finalization");
+            if (started) _check(progress >= ghostEscrowAt[ga], "progress stamp before the escrow");
+            bool graduable = started && !closed
+                && (remaining == 0
+                    || vm.getBlockTimestamp() >= uint256(progress) + 24 hours
+                    || vm.getBlockTimestamp() >= ghostEscrowAt[ga] + 7 days);
+            _check(liq.canGraduate(ga) == graduable, "canGraduate disagrees with the stall clock and the 7-day cap");
             for (uint256 j; j < actors.length; ++j) {
                 if (ghostErased[ga][actors[j]]) _check(game.erased(actors[j]), "erasure undone");
             }
@@ -512,9 +569,10 @@ contract V4BailConversionInvariantTest is BaseTest {
         sels[22] = V4Handler.creditFees.selector;
         sels[23] = V4Handler.launch.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: sels}));
-        bytes4[] memory more = new bytes4[](2);
+        bytes4[] memory more = new bytes4[](3);
         more[0] = V4Handler.claimGame.selector;
         more[1] = V4Handler.claimLiquidity.selector;
+        more[2] = V4Handler.warpDay.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: more}));
     }
 
@@ -647,6 +705,7 @@ contract V4BailConversionInvariantTest is BaseTest {
         handler.bailOuts();
         handler.chunksWithProgress();
         handler.imdGraduations();
+        handler.bandStalls();
     }
 
     // ---- helpers ------------------------------------------------------------------------------------------

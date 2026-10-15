@@ -303,6 +303,8 @@ contract V4EdgesTest is BaseTest {
         pvp.prepareConversion();
         _finish();
         uint256 raised = pvp.ethRaised();
+        assertEq(liq.anchorOf(address(pvp)), managerPrice(imdKey), "finalize anchors the IMD/ETH spot");
+        vm.warp(vm.getBlockTimestamp() + 1 hours); // nobody touches the game for an hour
         pvp.prepareConversion();
         assertEq(liq.totalConversionEth(), raised);
         assertEq(address(pvp).balance, pvp.claimable(address(this)) + pvp.pot());
@@ -311,7 +313,14 @@ contract V4EdgesTest is BaseTest {
         (uint256 remaining,,,, uint64 progress, bool started,) = liq.conversions(address(pvp));
         assertTrue(started);
         assertEq(remaining, raised);
-        assertEq(progress, pvp.finalizedAt(), "the stall clock starts at finalization, not at escrow");
+        assertEq(progress, vm.getBlockTimestamp(), "the stall clock starts when the escrow is created");
+        assertEq(progress, pvp.finalizedAt() + 1 hours, "not at finalization: an untouched game is not a stall");
+        vm.warp(uint256(pvp.finalizedAt()) + 24 hours);
+        assertFalse(liq.canGraduate(address(pvp)), "24 h after finalization is not yet a stall");
+        assertEq(pvp.status(), 8);
+        vm.warp(uint256(progress) + 24 hours);
+        assertTrue(liq.canGraduate(address(pvp)), "24 h after the escrow with no progress is");
+        vm.warp(uint256(progress)); // back to the escrow block: convert normally
         _convertAll(pvp);
         pvp.graduate();
         vm.expectRevert(abi.encodeWithSignature("PadNotConverting()"));
@@ -459,6 +468,129 @@ contract V4EdgesTest is BaseTest {
             : PadLib.mulDiv(1 << 192, 1e18, price * price);
         assertApproxEqRel(quotePerCoin, PadLib.mulDiv(received, 1e18, lpCoins), 0.011e18, "partial IMD, same price");
         assertEq(address(liq).balance, liq.burnBucket() + liq.totalConversionEth());
+    }
+
+    // ---- anchor band (revision) ---------------------------------------------------------------------------
+
+    /// @dev Pushes the IMD/ETH spot about 4% (sqrt) under the anchor by buying IMD, and returns the pusher.
+    function _pushBelowBand() internal returns (V4Router pusher, uint256 pushed) {
+        pusher = new V4Router(pm);
+        vm.deal(address(pusher), 30 ether);
+        pusher.trade(imdKey, true, 3 ether);
+        pushed = managerPrice(imdKey);
+        uint256 anchor = liq.anchorOf(address(pvp));
+        assertLt(pushed, anchor - anchor * 100 / 10_000, "spot is below the 1% sqrt band under the anchor");
+    }
+
+    function test_bandStallDoesNotConsumeIntervalAndArbitrageReopensItInTheSameBlock() public {
+        _start(1);
+        rollAs(pvp, players[0]);
+        _finish();
+        assertEq(liq.anchorOf(address(0xBEEF)), 0, "a game never observed has no anchor");
+        (V4Router pusher, uint256 pushed) = _pushBelowBand();
+        pvp.prepareConversion();
+        (uint256 left,,,,, bool started,) = liq.conversions(address(pvp));
+        assertTrue(started);
+        vm.expectEmit(true, false, false, true, address(liq));
+        emit PadLiquidity.ConversionStalled(address(pvp));
+        liq.convertChunk(address(pvp));
+        (uint256 left1,, uint256 got1, uint64 attempted1, uint64 progress1,,) = liq.conversions(address(pvp));
+        assertEq(left1, left, "no fill below the band");
+        assertEq(got1, 0);
+        assertEq(attempted1, 0, "a banded stall does not consume the 30 s interval");
+        assertEq(progress1, uint64(vm.getBlockTimestamp()), "the escrow stamp is untouched by a stall");
+        assertEq(managerPrice(imdKey), pushed, "the venue was not touched");
+        assertEq(pvp.status(), 8, "still converting");
+        // the same block: a second stalled call is allowed and changes nothing
+        liq.convertChunk(address(pvp));
+        (uint256 left2,,, uint64 attempted2,,,) = liq.conversions(address(pvp));
+        assertEq(left2, left);
+        assertEq(attempted2, 0);
+        // an arbitrageur sells the IMD back; the very next call fills without waiting for an interval
+        pusher.trade(imdKey, false, imd.balanceOf(address(pusher)));
+        assertGe(managerPrice(imdKey), liq.anchorOf(address(pvp)) * 99 / 100, "venue back inside the band");
+        liq.convertChunk(address(pvp));
+        (uint256 left3,, uint256 got3, uint64 attempted3,,,) = liq.conversions(address(pvp));
+        assertEq(left3, 0, "one roll fits a single chunk");
+        assertGt(got3, 0);
+        assertEq(attempted3, uint64(vm.getBlockTimestamp()));
+        assertTrue(liq.canGraduate(address(pvp)));
+        assertEq(imd.balanceOf(address(liq)), liq.totalConversionIMD() + liq.burnIMD());
+    }
+
+    function test_heldStallIsFollowedByAnchorDecayWithinHoursNotMinutes() public {
+        _start(1);
+        rollAs(pvp, players[0]);
+        _finish();
+        uint256 anchor0 = liq.anchorOf(address(pvp));
+        (, uint256 pushed) = _pushBelowBand();
+        pvp.prepareConversion();
+        (uint256 left,,,, uint64 progress0,,) = liq.conversions(address(pvp));
+        // four hours: the anchor has decayed 2% in sqrt price, the band is still above the held spot
+        vm.warp(vm.getBlockTimestamp() + 4 hours);
+        uint256 anchor4 = liq.anchorOf(address(pvp));
+        assertEq(anchor4, anchor0 * (10_000 - 200) / 10_000, "0.5% sqrt per hour");
+        assertLt(pushed, anchor4 - anchor4 * 100 / 10_000);
+        liq.convertChunk(address(pvp));
+        (uint256 left1,,, uint64 attempted1, uint64 progress1,,) = liq.conversions(address(pvp));
+        assertEq(left1, left, "still stalled after four hours");
+        assertEq(attempted1, 0);
+        assertEq(progress1, progress0, "a stall never refreshes the clock");
+        // the stalled call re-stamped the decayed anchor; decay continues from there
+        assertEq(liq.anchorOf(address(pvp)), anchor4);
+        // eight hours in total: the band has fallen under the held spot and the chunk goes through
+        vm.warp(vm.getBlockTimestamp() + 4 hours);
+        uint256 anchor8 = liq.anchorOf(address(pvp));
+        assertLt(anchor8, anchor4);
+        assertGt(pushed, anchor8 - anchor8 * 100 / 10_000);
+        uint256 spot = managerPrice(imdKey);
+        liq.convertChunk(address(pvp));
+        (uint256 left2,, uint256 got2, uint64 attempted2, uint64 progress2,,) = liq.conversions(address(pvp));
+        assertEq(left2, 0);
+        assertGt(got2, 0);
+        assertEq(attempted2, uint64(vm.getBlockTimestamp()));
+        assertEq(progress2, uint64(vm.getBlockTimestamp()), "completion stamps progress");
+        assertGe(managerPrice(imdKey), anchor8 - anchor8 * 100 / 10_000, "never below the band");
+        assertGe(managerPrice(imdKey), spot - spot * 50 / 10_000, "never past the 1% spot limit");
+        assertEq(liq.anchorOf(address(pvp)), anchor8, "a lower spot does not lower the anchor");
+    }
+
+    function test_heldStallForTwentyFourHoursGraduatesNativeWhenNoIMDWasEverConverted() public {
+        _start(1);
+        rollAs(pvp, players[0]);
+        _finish();
+        (V4Router pusher,) = _pushBelowBand();
+        pvp.prepareConversion();
+        (,,,, uint64 progress0,,) = liq.conversions(address(pvp));
+        // the pusher keeps the venue down: each hour it buys IMD again so the spot stays under the band,
+        // and a keeper tries a chunk each time
+        for (uint256 h = 1; h <= 24; ++h) {
+            vm.warp(uint256(progress0) + h * 1 hours);
+            uint256 anchor = liq.anchorOf(address(pvp));
+            if (managerPrice(imdKey) >= anchor - anchor * 100 / 10_000) pusher.trade(imdKey, true, 0.5 ether);
+            liq.convertChunk(address(pvp));
+            (uint256 l,, uint256 got, uint64 attempted, uint64 progress,,) = liq.conversions(address(pvp));
+            assertEq(got, 0, "the held venue never sells IMD into the band");
+            assertEq(attempted, 0);
+            assertEq(progress, progress0);
+            assertEq(l, pvp.ethRaised());
+        }
+        assertTrue(liq.canGraduate(address(pvp)), "24 h without progress: never stranded");
+        uint256 carry = pad.carryPot();
+        uint256 raised = pvp.ethRaised();
+        uint256 liqEth = address(liq).balance;
+        pvp.graduate();
+        assertTrue(pvp.graduated());
+        assertFalse(pvp.failed());
+        assertTrue(pvpToken.unlocked());
+        assertFalse(liq.imdPool(address(pvpToken)), "no IMD at all: the v3 coin/ETH pool");
+        assertEq(pad.carryPot(), carry, "the ETH went into the pool, not to carry");
+        assertEq(liq.totalConversionEth(), 0);
+        assertEq(address(liq).balance, liqEth - raised, "the escrow left for the pool");
+        PoolKey memory key = liq.poolKey(address(pvpToken));
+        assertEq(key.currency0, address(0));
+        assertGt(managerPrice(key), 0);
+        assertEq(pvp.status(), 5);
     }
 
     // ---- burn --------------------------------------------------------------------------------------------
