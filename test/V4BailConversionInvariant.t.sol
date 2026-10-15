@@ -218,7 +218,7 @@ contract V4Handler is Test {
         bool open = started && !closed && remaining != 0;
         // The chunk's floor: 1% sqrt under spot, but never under the anchor band (1% sqrt under the
         // decaying best spot). A spot already at or under that floor must stall without side effects.
-        uint256 anchor = liq.anchorOf(address(game));
+        uint256 anchor = liq.anchor();
         uint256 ref = anchor > spot ? anchor : spot;
         uint256 limit = spot - spot * 50 / 10_000;
         if (ref - ref * 100 / 10_000 > limit) limit = ref - ref * 100 / 10_000;
@@ -247,7 +247,7 @@ contract V4Handler is Test {
                 _check(newSpot >= spot - spot * 50 / 10_000, "chunk moved the venue below the 1% limit");
                 _check(newSpot >= limit, "chunk moved the venue below the anchor band");
                 _check(newSpot <= spot, "ETH -> IMD chunk raised the sqrt price");
-                _check(liq.anchorOf(address(game)) >= ref, "a chunk lowered the anchor");
+                _check(liq.anchor() >= ref, "a chunk lowered the anchor");
                 ghostLastProgress[address(game)] = vm.getBlockTimestamp();
             } else {
                 _check(i2 == received, "IMD credited without ETH spent");
@@ -346,6 +346,19 @@ contract V4Handler is Test {
             imd.mint(address(trader), amount);
         }
         try trader.trade(imdKey, zeroForOne, amount) {} catch {}
+        _after();
+    }
+
+    /// @dev Anyone may observe the venue: the pad-wide anchor becomes the spot when it is higher and is
+    /// otherwise left to its decay. It never falls because of an observation.
+    function observe(uint256 a) external {
+        uint256 before = liq.anchor();
+        uint256 spot = _spot(imdKey);
+        uint256 expected = spot > before ? spot : before;
+        vm.prank(_actor(a));
+        uint256 ref = liq.observeMarket();
+        _check(ref == expected, "observation returned neither the spot nor the decayed anchor");
+        _check(liq.anchor() == expected, "observation lowered the anchor or ignored a higher spot");
         _after();
     }
 
@@ -569,10 +582,11 @@ contract V4BailConversionInvariantTest is BaseTest {
         sels[22] = V4Handler.creditFees.selector;
         sels[23] = V4Handler.launch.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: sels}));
-        bytes4[] memory more = new bytes4[](3);
+        bytes4[] memory more = new bytes4[](4);
         more[0] = V4Handler.claimGame.selector;
         more[1] = V4Handler.claimLiquidity.selector;
         more[2] = V4Handler.warpDay.selector;
+        more[3] = V4Handler.observe.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: more}));
     }
 

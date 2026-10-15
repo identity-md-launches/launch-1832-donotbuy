@@ -6,10 +6,70 @@ import {PadGame} from "../src/PadGame.sol";
 import {PadToken} from "../src/PadToken.sol";
 import {PadLiquidity} from "../src/PadLiquidity.sol";
 import {PadLib} from "../src/libs/PadLib.sol";
-import {PoolKey} from "../src/interfaces/Interfaces.sol";
+import {PoolKey, IPoolManager, IUnlockCallback, SwapParams, IERC20Min} from "../src/interfaces/Interfaces.sol";
 import {V4Router} from "./RealV4.sol";
 import {Rejector} from "./mocks/Mocks.sol";
 import {TestIMD} from "./V4Pad.t.sol";
+import {PvPPad} from "../src/PvPPad.sol";
+
+/// @dev Inside one PoolManager unlock: sells IMD (spot up), tries to record that spot through the public
+/// observeMarket() and through the pad's own upkeep, then buys the IMD back before settling.
+contract FlashObserver is IUnlockCallback {
+    IPoolManager immutable pm;
+    PadLiquidity immutable liq;
+    PvPPad immutable pad;
+    uint256 public spotInside;
+    uint256 public anchorInside;
+    bytes public chunkReason;
+
+    constructor(IPoolManager pm_, PadLiquidity liq_, PvPPad pad_) {
+        pm = pm_;
+        liq = liq_;
+        pad = pad_;
+    }
+
+    receive() external payable {}
+
+    function run(PoolKey memory key, uint256 imdAmount, address game) external {
+        pm.unlock(abi.encode(key, imdAmount, game));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(pm), "manager only");
+        (PoolKey memory key, uint256 amount, address game) = abi.decode(data, (PoolKey, uint256, address));
+        int256 d =
+            pm.swap(key, SwapParams(false, -int256(amount), 1461446703485210103287273052203988822378723970341), "");
+        _settle(key.currency0, int128(d >> 128));
+        _settle(key.currency1, int128(d));
+        spotInside = liq.sqrtPriceOf(key);
+        anchorInside = liq.observeMarket();
+        pad.upkeep();
+        try liq.convertChunk(game) {}
+        catch (bytes memory r) {
+            chunkReason = r;
+        }
+        d = pm.swap(key, SwapParams(true, -int256(address(this).balance), 4295128740), "");
+        _settle(key.currency0, int128(d >> 128));
+        _settle(key.currency1, int128(d));
+        return "";
+    }
+
+    function _settle(address currency, int128 delta) private {
+        if (delta < 0) {
+            uint256 amount = uint256(uint128(-delta));
+            if (currency == address(0)) {
+                pm.sync(address(0));
+                pm.settle{value: amount}();
+            } else {
+                pm.sync(currency);
+                require(IERC20Min(currency).transfer(address(pm), amount));
+                pm.settle();
+            }
+        } else if (delta > 0) {
+            pm.take(currency, address(this), uint256(uint128(delta)));
+        }
+    }
+}
 
 /// @notice Failure paths and boundaries of the v4 changes that the main v4 suite does not pin:
 /// zero-coin and boundary bail-outs, bail-outs after the bell and after the hard end, expired pending
@@ -303,7 +363,7 @@ contract V4EdgesTest is BaseTest {
         pvp.prepareConversion();
         _finish();
         uint256 raised = pvp.ethRaised();
-        assertEq(liq.anchorOf(address(pvp)), managerPrice(imdKey), "finalize anchors the IMD/ETH spot");
+        assertEq(liq.anchor(), managerPrice(imdKey), "finalize anchors the IMD/ETH spot");
         vm.warp(vm.getBlockTimestamp() + 1 hours); // nobody touches the game for an hour
         pvp.prepareConversion();
         assertEq(liq.totalConversionEth(), raised);
@@ -478,7 +538,7 @@ contract V4EdgesTest is BaseTest {
         vm.deal(address(pusher), 30 ether);
         pusher.trade(imdKey, true, 3 ether);
         pushed = managerPrice(imdKey);
-        uint256 anchor = liq.anchorOf(address(pvp));
+        uint256 anchor = liq.anchor();
         assertLt(pushed, anchor - anchor * 100 / 10_000, "spot is below the 1% sqrt band under the anchor");
     }
 
@@ -486,7 +546,7 @@ contract V4EdgesTest is BaseTest {
         _start(1);
         rollAs(pvp, players[0]);
         _finish();
-        assertEq(liq.anchorOf(address(0xBEEF)), 0, "a game never observed has no anchor");
+        assertEq(liq.anchor(), managerPrice(imdKey), "the finalize upkeep observed the untouched spot");
         (V4Router pusher, uint256 pushed) = _pushBelowBand();
         pvp.prepareConversion();
         (uint256 left,,,,, bool started,) = liq.conversions(address(pvp));
@@ -508,7 +568,7 @@ contract V4EdgesTest is BaseTest {
         assertEq(attempted2, 0);
         // an arbitrageur sells the IMD back; the very next call fills without waiting for an interval
         pusher.trade(imdKey, false, imd.balanceOf(address(pusher)));
-        assertGe(managerPrice(imdKey), liq.anchorOf(address(pvp)) * 99 / 100, "venue back inside the band");
+        assertGe(managerPrice(imdKey), liq.anchor() * 99 / 100, "venue back inside the band");
         liq.convertChunk(address(pvp));
         (uint256 left3,, uint256 got3, uint64 attempted3,,,) = liq.conversions(address(pvp));
         assertEq(left3, 0, "one roll fits a single chunk");
@@ -522,13 +582,13 @@ contract V4EdgesTest is BaseTest {
         _start(1);
         rollAs(pvp, players[0]);
         _finish();
-        uint256 anchor0 = liq.anchorOf(address(pvp));
+        uint256 anchor0 = liq.anchor();
         (, uint256 pushed) = _pushBelowBand();
         pvp.prepareConversion();
         (uint256 left,,,, uint64 progress0,,) = liq.conversions(address(pvp));
         // four hours: the anchor has decayed 2% in sqrt price, the band is still above the held spot
         vm.warp(vm.getBlockTimestamp() + 4 hours);
-        uint256 anchor4 = liq.anchorOf(address(pvp));
+        uint256 anchor4 = liq.anchor();
         assertEq(anchor4, anchor0 * (10_000 - 200) / 10_000, "0.5% sqrt per hour");
         assertLt(pushed, anchor4 - anchor4 * 100 / 10_000);
         liq.convertChunk(address(pvp));
@@ -537,10 +597,10 @@ contract V4EdgesTest is BaseTest {
         assertEq(attempted1, 0);
         assertEq(progress1, progress0, "a stall never refreshes the clock");
         // the stalled call re-stamped the decayed anchor; decay continues from there
-        assertEq(liq.anchorOf(address(pvp)), anchor4);
+        assertEq(liq.anchor(), anchor4);
         // eight hours in total: the band has fallen under the held spot and the chunk goes through
         vm.warp(vm.getBlockTimestamp() + 4 hours);
-        uint256 anchor8 = liq.anchorOf(address(pvp));
+        uint256 anchor8 = liq.anchor();
         assertLt(anchor8, anchor4);
         assertGt(pushed, anchor8 - anchor8 * 100 / 10_000);
         uint256 spot = managerPrice(imdKey);
@@ -552,7 +612,7 @@ contract V4EdgesTest is BaseTest {
         assertEq(progress2, uint64(vm.getBlockTimestamp()), "completion stamps progress");
         assertGe(managerPrice(imdKey), anchor8 - anchor8 * 100 / 10_000, "never below the band");
         assertGe(managerPrice(imdKey), spot - spot * 50 / 10_000, "never past the 1% spot limit");
-        assertEq(liq.anchorOf(address(pvp)), anchor8, "a lower spot does not lower the anchor");
+        assertEq(liq.anchor(), anchor8, "a lower spot does not lower the anchor");
     }
 
     function test_heldStallForTwentyFourHoursGraduatesNativeWhenNoIMDWasEverConverted() public {
@@ -566,7 +626,7 @@ contract V4EdgesTest is BaseTest {
         // and a keeper tries a chunk each time
         for (uint256 h = 1; h <= 24; ++h) {
             vm.warp(uint256(progress0) + h * 1 hours);
-            uint256 anchor = liq.anchorOf(address(pvp));
+            uint256 anchor = liq.anchor();
             if (managerPrice(imdKey) >= anchor - anchor * 100 / 10_000) pusher.trade(imdKey, true, 0.5 ether);
             liq.convertChunk(address(pvp));
             (uint256 l,, uint256 got, uint64 attempted, uint64 progress,,) = liq.conversions(address(pvp));
@@ -659,5 +719,57 @@ contract V4EdgesTest is BaseTest {
         assertGt(pvpToken.balanceOf(address(crown)), 999 ether);
         assertEq(liq.claimable(address(crown)), 0, "nothing parked: IMD is not pushed as ETH");
         assertEq(liq.getPool(0).failures, 0);
+    }
+
+    // ---- pad-wide anchor (revision) --------------------------------------------------------------------------
+
+    function test_flashPushInsideAnUnlockIsNotRecordedByObserveMarketOrThePadUpkeep() public {
+        _start(1);
+        rollAs(pvp, players[0]);
+        _finish();
+        pvp.prepareConversion();
+        uint256 fair = managerPrice(imdKey);
+        uint256 a0 = liq.anchor();
+        assertEq(a0, fair, "the finalize upkeep observed the fair spot");
+        FlashObserver flash = new FlashObserver(pm, liq, pad);
+        imd.mint(address(flash), 12 ether);
+        flash.run(imdKey, 12 ether, address(pvp));
+        assertGt(flash.spotInside(), fair * 115 / 100, "the flash sell moved the spot by over 15%");
+        assertEq(flash.anchorInside(), a0, "observeMarket inside an unlock only returns the anchor");
+        assertEq(liq.anchor(), a0, "neither the public call nor the pad upkeep recorded the flash spot");
+        assertEq(flash.chunkReason(), abi.encodeWithSignature("PadManagerUnlocked()"), "no chunk inside an unlock");
+        (uint256 left,, uint256 got,,,,) = liq.conversions(address(pvp));
+        assertEq(got, 0);
+        assertEq(left, pvp.ethRaised(), "the escrow is untouched");
+        assertApproxEqRel(managerPrice(imdKey), fair, 0.01e18, "the venue is back near the fair price");
+        // once the manager is locked again an observation records the real, settled spot
+        vm.prank(players[5]);
+        liq.observeMarket();
+        assertEq(liq.anchor(), managerPrice(imdKey) > a0 ? managerPrice(imdKey) : a0);
+        liq.convertChunk(address(pvp));
+        (left,, got,,,,) = liq.conversions(address(pvp));
+        assertEq(left, 0, "the honest chunk converts at the fair price");
+        assertGt(got, 0);
+    }
+
+    function test_strangerObservationOfAGenuineRiseLetsTheNextChunkSellAtTheBetterPrice() public {
+        _start(1);
+        rollAs(pvp, players[0]);
+        _finish();
+        uint256 fair = managerPrice(imdKey);
+        assertEq(liq.anchor(), fair);
+        router.trade(imdKey, false, 2 ether); // a genuine, lasting move up: more IMD per ETH
+        uint256 up = managerPrice(imdKey);
+        assertGt(up, fair);
+        vm.prank(players[7]);
+        assertEq(liq.observeMarket(), up, "anyone may record a higher spot");
+        assertEq(liq.anchor(), up);
+        liq.convertChunk(address(pvp));
+        (uint256 left, uint256 spent, uint256 got,,,,) = liq.conversions(address(pvp));
+        assertEq(left, 0, "no stall: the anchor never exceeds the spot it was read from");
+        // price = (sqrt/2^96)^2 IMD per ETH; the chunk must receive at least the fair quote less the 1% fee
+        uint256 fairQuote = PadLib.mulDiv(PadLib.mulDiv(fair, fair, 1 << 96), spent, 1 << 96);
+        assertGt(got, fairQuote * 985 / 1000, "the raised market pays the game at least the fair rate");
+        assertGe(managerPrice(imdKey), up - up * 100 / 10_000, "and the chunk stays inside the band");
     }
 }
