@@ -39,6 +39,14 @@ contract PadLiquidity is IUnlockCallback {
     uint160 internal constant MAX_SQRT_PRICE_LIMIT = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_341;
     uint256 internal constant CONVERT_INTERVAL = 30;
     uint256 internal constant CONVERT_TIMEOUT = 24 hours;
+    /// @notice Hard bound on a conversion, whatever progress it makes: never stranded.
+    uint256 internal constant CONVERT_MAX_DURATION = 7 days;
+    /// @notice A chunk never sells below the game's anchor minus 1% in sqrt price (about 2% in price).
+    uint256 internal constant ANCHOR_BAND_BPS = 100;
+    /// @notice The anchor follows a falling market by at most 0.5% sqrt price (about 1% price) per hour.
+    uint256 internal constant ANCHOR_DECAY_BPS_PER_HOUR = 50;
+    /// @notice Converting at least 1/1000 of the escrow since the last stamp is needed to count as progress.
+    uint256 internal constant PROGRESS_FLOOR_DIVISOR = 1000;
     uint256 internal constant Q96 = 1 << 96;
     address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
     uint256 internal constant BURN_MAX = 0.02 ether;
@@ -75,6 +83,15 @@ contract PadLiquidity is IUnlockCallback {
         uint64 lastFailureBlock;
         uint8 failures;
         uint256 imdFees;
+    }
+
+    /// @dev anchor: best IMD/ETH sqrt price seen for a game (at finalize and at each chunk), decaying
+    /// linearly from anchorAt. mark: convertedEth at the last lastProgress stamp.
+    struct Guard {
+        uint160 anchor;
+        uint64 anchorAt;
+        uint64 startedAt;
+        uint256 mark;
     }
 
     struct Conversion {
@@ -114,6 +131,7 @@ contract PadLiquidity is IUnlockCallback {
     Pool[] internal pools;
     mapping(uint256 => uint256) public poolIndexOf; // launchId => index + 1
     mapping(address => uint256) public claimable;
+    mapping(address => Guard) internal guards;
 
     event ConversionStarted(address indexed game, uint256 eth, uint256 deadline);
     event ConversionProgress(address indexed game, uint256 spent, uint256 received, uint256 remaining);
@@ -160,7 +178,7 @@ contract PadLiquidity is IUnlockCallback {
 
     /// @dev Only the PoolManager pays ETH here (fee collection); everything else uses fundBurn/graduate.
     receive() external payable {
-        if (!(msg.sender == address(poolManager))) revert PadErrors.PadNotPoolManager();
+        _onlyManager();
     }
 
     function bindKing() external {
@@ -201,21 +219,50 @@ contract PadLiquidity is IUnlockCallback {
     }
 
     /// @dev Registered games escrow their net curve ETH once, after finalization. Donations cannot
-    /// affect conversion balances, graduation price or the stall timer.
-    function startConversion(uint256 launchId, uint64 finalizedAt) external payable {
-        if (!(msg.sender == IPvPPad(pad).gameOf(launchId))) revert PadErrors.PadNotGame();
+    /// affect conversion balances, graduation price or the stall timer. The stall clock starts when
+    /// the escrow is created, not at finalization: an untouched game is not "no progress".
+    function startConversion(uint256 launchId, uint64) external payable {
+        _onlyGame(launchId);
         Conversion storage c = conversions[msg.sender];
         if (!(!c.started && msg.value != 0)) revert PadErrors.PadConversionStartedOrEmpty();
         c.started = true;
         c.remainingEth = msg.value;
-        c.lastProgress = finalizedAt;
+        c.lastProgress = uint64(block.timestamp);
+        guards[msg.sender].startedAt = uint64(block.timestamp);
         totalConversionEth += msg.value;
-        emit ConversionStarted(msg.sender, msg.value, uint256(finalizedAt) + CONVERT_TIMEOUT);
+        emit ConversionStarted(msg.sender, msg.value, block.timestamp + CONVERT_TIMEOUT);
     }
 
-    /// @notice One spot-relative 1% price-limited ETH -> IMD chunk, at most once per 30 seconds/game.
-    /// A missing/broken/empty pool records no progress and does not postpone the fallback deadline.
+    /// @notice Called by the game at finalization: records the IMD/ETH spot as the conversion anchor
+    /// before anyone knows the chunks are coming. Never reverts for a missing venue.
+    function observe(uint256 launchId) external {
+        _onlyGame(launchId);
+        _anchor(msg.sender, sqrtPriceOf(imdEthKey()));
+    }
+
+    /// @notice The game's anchor now: the best spot seen, minus 0.5% sqrt price per elapsed hour.
+    function anchorOf(address game) public view returns (uint256) {
+        Guard storage g = guards[game];
+        uint256 cut = (block.timestamp - g.anchorAt) * ANCHOR_DECAY_BPS_PER_HOUR;
+        if (cut >= 10_000 * 1 hours) return 0;
+        return uint256(g.anchor) * (10_000 * 1 hours - cut) / (10_000 * 1 hours);
+    }
+
+    function _anchor(address game, uint256 spot) internal returns (uint256 ref) {
+        ref = anchorOf(game);
+        if (spot > ref) ref = spot;
+        Guard storage g = guards[game];
+        g.anchor = uint160(ref);
+        g.anchorAt = uint64(block.timestamp);
+    }
+
+    /// @notice One ETH -> IMD chunk, at most once per 30 seconds/game, limited to a 1% price move from
+    /// spot and never below the anchor band (2% price under the decaying best spot), so a position held
+    /// across all chunks cannot walk the game's price. A missing/broken/empty/out-of-band pool records
+    /// no progress, does not consume the interval and does not postpone the fallback deadline.
     function convertChunk(address game) external guard {
+        // Inside a PoolManager unlock the venue is unreachable: reject instead of recording an attempt.
+        requireManagerLocked();
         if (!conversions[game].started) IPadGame(game).prepareConversion();
         Conversion storage c = conversions[game];
         if (!(c.started && !c.closed && c.remainingEth != 0)) revert PadErrors.PadNotConverting();
@@ -224,16 +271,37 @@ contract PadLiquidity is IUnlockCallback {
         }
         // A caller cannot consume the per-game interval with a deliberately underfunded probe.
         if (gasleft() < 350_000 + uint256(350_000) / 63 + 100_000) revert PadErrors.PadConversionGas();
-        c.lastAttempt = uint64(block.timestamp);
+        uint256 spot = sqrtPriceOf(imdEthKey());
+        uint256 ref = _anchor(game, spot);
+        uint256 limit;
+        // spot and ref are uint160, so the products fit.
+        unchecked {
+            limit = spot - spot * IMPACT_BPS / 10_000;
+            uint256 band = ref - ref * ANCHOR_BAND_BPS / 10_000;
+            if (band > limit) limit = band;
+        }
+        if (limit <= MIN_SQRT_PRICE_LIMIT) limit = MIN_SQRT_PRICE_LIMIT + 1;
+        if (limit >= spot) {
+            emit ConversionStalled(game);
+            return;
+        }
         // The bounded self-call rolls back all PoolManager deltas on error, preserving the escrow.
-        try this.executeConversion{gas: 350_000}(c.remainingEth) returns (uint256 spent, uint256 received) {
+        try this.executeConversion{gas: 350_000}(c.remainingEth, uint160(limit)) returns (
+            uint256 spent, uint256 received
+        ) {
+            c.lastAttempt = uint64(block.timestamp);
             if (spent != 0 && received != 0) {
                 c.remainingEth -= spent;
                 c.convertedEth += spent;
                 c.imdReceived += received;
-                c.lastProgress = uint64(block.timestamp);
                 totalConversionEth -= spent;
                 totalConversionIMD += received;
+                // Dust fills on a collapsed venue do not refresh the stall clock.
+                uint256 total = c.remainingEth + c.convertedEth;
+                if (c.remainingEth == 0 || (c.convertedEth - guards[game].mark) * PROGRESS_FLOOR_DIVISOR >= total) {
+                    guards[game].mark = c.convertedEth;
+                    c.lastProgress = uint64(block.timestamp);
+                }
             }
             emit ConversionProgress(game, spent, received, c.remainingEth);
         } catch {
@@ -241,16 +309,33 @@ contract PadLiquidity is IUnlockCallback {
         }
     }
 
-    function executeConversion(uint256 amount) external returns (uint256 spent, uint256 received) {
+    function executeConversion(uint256 amount, uint160 limit) external returns (uint256 spent, uint256 received) {
+        _onlySelf();
+        return abi.decode(poolManager.unlock(abi.encode(ACT_CONVERT, imdEthKey(), amount, limit)), (uint256, uint256));
+    }
+
+    function _king() internal view returns (address) {
+        return IKingView(king).king();
+    }
+
+    function _onlySelf() internal view {
         if (!(msg.sender == address(this) && locked)) revert PadErrors.PadNotSelf();
-        return abi.decode(poolManager.unlock(abi.encode(ACT_CONVERT, imdEthKey(), amount)), (uint256, uint256));
+    }
+
+    function _onlyManager() internal view {
+        if (!(msg.sender == address(poolManager))) revert PadErrors.PadNotPoolManager();
+    }
+
+    function _onlyGame(uint256 launchId) internal view {
+        if (!(msg.sender == IPvPPad(pad).gameOf(launchId))) revert PadErrors.PadNotGame();
     }
 
     function canGraduate(address game) public view returns (bool) {
         Conversion storage c = conversions[game];
-        return
-            c.started && !c.closed
-                && (c.remainingEth == 0 || block.timestamp >= uint256(c.lastProgress) + CONVERT_TIMEOUT);
+        return c.started && !c.closed
+            && (c.remainingEth == 0
+                || block.timestamp >= uint256(c.lastProgress) + CONVERT_TIMEOUT
+                || block.timestamp >= uint256(guards[game].startedAt) + CONVERT_MAX_DURATION);
     }
 
     /// @notice Tokens arrive from the game. Quote funds come exclusively from that game's escrow.
@@ -260,7 +345,7 @@ contract PadLiquidity is IUnlockCallback {
         payable
         guard
     {
-        if (!(msg.sender == IPvPPad(pad).gameOf(launchId))) revert PadErrors.PadNotGame();
+        _onlyGame(launchId);
         if (!(hook != address(0))) revert PadErrors.PadPadNotOpen();
         if (!(poolIndexOf[launchId] == 0)) revert PadErrors.PadGraduated();
         Conversion storage c = conversions[msg.sender];
@@ -338,7 +423,7 @@ contract PadLiquidity is IUnlockCallback {
 
     function _distribute(uint256 n, bool strict) internal {
         requireManagerLocked();
-        address k = IKingView(king).king();
+        address k = _king();
         uint256 count = pools.length;
         if (k == address(0) || count == 0 || n == 0) return;
         uint256 floor;
@@ -369,7 +454,7 @@ contract PadLiquidity is IUnlockCallback {
     /// @notice Anyone can retry any pool, including a broken one. Success clears the flag.
     function retryPool(uint256 idx) external guard returns (bool) {
         requireManagerLocked();
-        address k = IKingView(king).king();
+        address k = _king();
         if (!(k != address(0))) revert PadErrors.PadNoKing();
         if (!(gasleft() >= COLLECT_GAS + COLLECTION_RESERVE_GAS)) revert PadErrors.PadCollectionGas();
         return _collect(idx, k);
@@ -408,7 +493,7 @@ contract PadLiquidity is IUnlockCallback {
     /// @dev The self-call isolates a pool's revert. Both currencies are paid to the captured king;
     /// tokens are never swapped or stashed, and rejected ETH stays owed to that same king.
     function collectPool(uint256 idx, address k) external {
-        if (!(msg.sender == address(this) && locked)) revert PadErrors.PadNotSelf();
+        _onlySelf();
         Pool storage p = pools[idx];
         PoolKey memory key = poolKey(p.token);
         bytes memory res = poolManager.unlock(abi.encode(ACT_COLLECT, key));
@@ -420,7 +505,7 @@ contract PadLiquidity is IUnlockCallback {
         if (t != 0) if (!(IPadToken(p.token).transfer(k, t))) revert PadErrors.PadTokenFees();
         if (imdPool[p.token]) {
             p.imdFees += q;
-            if (q != 0) if (!(IPadToken(imd).transfer(k, q))) revert PadErrors.PadIMDFees();
+            if (q != 0) if (!(_transfer(imd, k, q))) revert PadErrors.PadIMDFees();
             emit ImdFeesCollected(p.launchId, k, q, t);
         } else {
             p.ethFees += q;
@@ -494,7 +579,7 @@ contract PadLiquidity is IUnlockCallback {
 
     // ---- v4 callback -----------------------------------------------------------------------------
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
-        if (!(msg.sender == address(poolManager))) revert PadErrors.PadNotPoolManager();
+        _onlyManager();
         uint8 action = abi.decode(data, (uint8));
         if (action == ACT_ADD) {
             (, PoolKey memory key, uint256 l, uint256 maxEth, uint256 maxTok) =
@@ -531,8 +616,8 @@ contract PadLiquidity is IUnlockCallback {
             return abi.encode(e, t);
         }
         if (action == ACT_CONVERT) {
-            (, PoolKey memory key, uint256 amount) = abi.decode(data, (uint8, PoolKey, uint256));
-            (uint256 spent, uint256 out) = _swap(key, true, amount);
+            (, PoolKey memory key, uint256 amount, uint160 limit) = abi.decode(data, (uint8, PoolKey, uint256, uint160));
+            (uint256 spent, uint256 out) = _swap(key, true, amount, limit);
             if (!(spent == 0 || out != 0)) revert PadErrors.PadZeroOutput();
             _settleEth(spent);
             if (out != 0) poolManager.take(imd, address(this), out);
@@ -542,19 +627,19 @@ contract PadLiquidity is IUnlockCallback {
             (, PoolKey memory key, uint256 amount) = abi.decode(data, (uint8, PoolKey, uint256));
             if (key.currency0 == address(0)) {
                 // The explicitly required zero-conversion genesis fallback has a native pool.
-                (uint256 nativeSpent, uint256 nativeOut) = _swap(key, true, amount);
+                (uint256 nativeSpent, uint256 nativeOut) = _swap(key, true, amount, _priceLimit(key, true));
                 _settleEth(nativeSpent);
                 if (nativeOut != 0) poolManager.take(key.currency1, DEAD, nativeOut);
                 return abi.encode(nativeSpent, nativeOut);
             }
             uint256 spent;
             uint256 bought;
-            if (amount != 0) (spent, bought) = _swap(imdEthKey(), true, amount);
+            if (amount != 0) (spent, bought) = _swap(imdEthKey(), true, amount, _priceLimit(imdEthKey(), true));
             bool zeroForOne = key.currency0 == imd;
             uint256 available = bought + burnIMD;
             uint256 used;
             uint256 out;
-            if (available != 0) (used, out) = _swap(key, zeroForOne, available);
+            if (available != 0) (used, out) = _swap(key, zeroForOne, available, _priceLimit(key, zeroForOne));
             if (!(spent == 0 || bought != 0)) revert PadErrors.PadZeroOutput();
             // Net the intermediate IMD delta within this single unlock; only bucket-owned IMD
             // can be settled. Unused intermediate coins stay separately accounted for next time.
@@ -568,9 +653,12 @@ contract PadLiquidity is IUnlockCallback {
         revert PadErrors.PadBadAction();
     }
 
-    function _swap(PoolKey memory key, bool zeroForOne, uint256 amount) internal returns (uint256 spent, uint256 out) {
+    function _swap(PoolKey memory key, bool zeroForOne, uint256 amount, uint160 limit)
+        internal
+        returns (uint256 spent, uint256 out)
+    {
         if (!(amount <= uint256(type(int256).max))) revert PadErrors.PadAmount();
-        int256 d = poolManager.swap(key, SwapParams(zeroForOne, -int256(amount), _priceLimit(key, zeroForOne)), "");
+        int256 d = poolManager.swap(key, SwapParams(zeroForOne, -int256(amount), limit), "");
         (int128 a0, int128 a1) = _split(d);
         int128 input = zeroForOne ? a0 : a1;
         int128 output = zeroForOne ? a1 : a0;
@@ -596,8 +684,14 @@ contract PadLiquidity is IUnlockCallback {
     function _settleToken(address token, uint256 amount) internal {
         if (amount == 0) return;
         poolManager.sync(token);
-        if (!(IPadToken(token).transfer(address(poolManager), amount))) revert PadErrors.PadToken();
+        if (!(_transfer(token, address(poolManager), amount))) revert PadErrors.PadToken();
         poolManager.settle();
+    }
+
+    /// @dev Accepts both `true` and an empty return, so an IMD without a bool return still settles.
+    function _transfer(address token, address to, uint256 amount) internal returns (bool) {
+        (bool ok, bytes memory r) = token.call(abi.encodeWithSelector(0xa9059cbb, to, amount));
+        return ok && (r.length == 0 || abi.decode(r, (bool)));
     }
 
     function _split(int256 delta) internal pure returns (int128 a0, int128 a1) {
@@ -617,6 +711,6 @@ contract PadLiquidity is IUnlockCallback {
     }
 
     function currentKing() external view returns (address) {
-        return king == address(0) ? address(0) : IKingView(king).king();
+        return king == address(0) ? address(0) : _king();
     }
 }

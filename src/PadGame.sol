@@ -164,7 +164,7 @@ contract PadGame {
 
     /// @notice One nonrefundable entry per wallet, no entry cap. First entry starts signup.
     function enter() external payable guard {
-        if (!(IPvPPad(pad).opened())) revert PadErrors.PadPadNotOpen();
+        _requireOpen();
         if (!(msg.value == ENTRY_PRICE)) revert PadErrors.PadEntryPrice();
         if (!(entryOf[msg.sender] == 0)) revert PadErrors.PadOneEntryPerWallet();
         bool first = entrants.length == 0;
@@ -174,15 +174,15 @@ contract PadGame {
         entryOf[msg.sender] = entrants.length;
         emit Entered(msg.sender, entrants.length, first);
         if (first) drawBounty = msg.value;
-        else IPadLiquidity(liquidity).fundBurn{value: msg.value}();
+        else _fundBurn(msg.value);
         if (first) IPvPPad(pad).noteFirstEntry(launchId);
-        IPvPPad(pad).upkeepFor(msg.sender);
+        _upkeep();
     }
 
     /// @notice Commit or advance the raffle. At most DRAW_BATCH random trials per call.
     /// n cannot select a seed or change the result; it only bounds work.
     function draw(uint256 n) external guard {
-        if (!(IPvPPad(pad).opened())) revert PadErrors.PadPadNotOpen();
+        _requireOpen();
         if (!(entrants.length != 0 && block.timestamp >= signupEnd())) revert PadErrors.PadSignupNotOver();
         if (!(n != 0)) revert PadErrors.PadZeroChunk();
         _draw(n, msg.sender);
@@ -251,18 +251,18 @@ contract PadGame {
 
     /// @notice Roll the dice: 0.002 ETH, 60 s cooldown, 90% curve, 7% pot, 2% burn (genesis: pot), 1% resolver tip.
     function roll() external payable guard {
-        if (!(IPvPPad(pad).opened())) revert PadErrors.PadPadNotOpen();
+        _requireOpen();
         if (!(msg.value == ROLL_PRICE)) revert PadErrors.PadRollPrice();
         if (!(drawComplete)) revert PadErrors.PadNotPlaying();
         uint256 idx = impOf[msg.sender];
         if (!(idx != 0)) revert PadErrors.PadNoImp();
-        if (!(!ended())) revert PadErrors.PadGameOver();
+        _notOver();
         Imp storage imp = imps[idx - 1];
         if (!(!erased[msg.sender])) revert PadErrors.PadErased();
         if (!(_lastActivity(imp) + DEATH > block.timestamp)) revert PadErrors.PadImpDead();
         if (!(imp.lastRoll == 0 || imp.lastRoll + COOLDOWN <= block.timestamp)) revert PadErrors.PadCooldown();
         if (imp.pendingRoll != 0) _resolveRoll(imp.pendingRoll - 1, msg.sender);
-        if (!(!ended())) revert PadErrors.PadGameOver(); // the previous roll may have rung the bell just now
+        _notOver(); // the previous roll may have rung the bell just now
 
         uint256 curveEth = msg.value * 90 / 100;
         uint256 burnEth = msg.value * 2 / 100;
@@ -284,9 +284,9 @@ contract PadGame {
         emit Rolled(msg.sender, idx - 1, rollId, rolls[rollId].commitBlock, tokensOut);
 
         if (tokensOut != 0) if (!(IPadToken(token).transfer(msg.sender, tokensOut))) revert PadErrors.PadToken();
-        if (!genesis && burnEth != 0) IPadLiquidity(liquidity).fundBurn{value: burnEth}();
+        if (!genesis && burnEth != 0) _fundBurn(burnEth);
         _resolve(RESOLVE_BATCH, msg.sender);
-        IPvPPad(pad).upkeepFor(msg.sender);
+        _upkeep();
     }
 
     /// @notice Sell every coin back to the curve and permanently erase this seat, during play only.
@@ -294,7 +294,7 @@ contract PadGame {
     function bailOut(uint256 minOut) external guard {
         if (!(drawComplete && !ended() && !finalized)) revert PadErrors.PadNotPlaying();
         if (!(impOf[msg.sender] != 0 && !erased[msg.sender])) revert PadErrors.PadNoImp();
-        uint256 coins = IPadToken(token).balanceOf(msg.sender);
+        uint256 coins = _balance(msg.sender);
         uint256 value = quoteSell(coins);
         uint256 cost = curveSpent[msg.sender];
         uint256 payout;
@@ -342,7 +342,7 @@ contract PadGame {
             return;
         }
         _prepareConversion();
-        if (!IPadLiquidity(liquidity).canGraduate(address(this))) {
+        if (!_canGraduate()) {
             // A bad or gas-hungry venue cannot prevent the 24-hour fallback.
             if (gasleft() > 650_000) {
                 try IPadLiquidity(liquidity).convertChunk{gas: 500_000}(address(this)) {} catch {}
@@ -359,25 +359,25 @@ contract PadGame {
             if (!finalized) _finalize(msg.sender);
             else if (!graduated) _conversionStep();
         }
-        IPvPPad(pad).upkeepFor(msg.sender);
+        _upkeep();
     }
 
     /// @notice Ranks living Imps and pays the pot. Permissionless once the game has ended.
     function finalize() external guard {
         _resolve(RESOLVE_BATCH, msg.sender);
         if (!(_finalize(msg.sender))) revert PadErrors.PadNotFinalizable();
-        IPvPPad(pad).upkeepFor(msg.sender);
+        _upkeep();
     }
 
     /// @notice Moves curve ETH and remaining tokens into the v4 pool (or burns all when no ETH was raised).
     function graduate() external guard {
         if (!(_graduate())) revert PadErrors.PadNotGraduable();
-        IPvPPad(pad).upkeepFor(msg.sender);
+        _upkeep();
     }
 
     /// @notice Pad-driven bounded upkeep: one draw chunk, roll resolution and one lifecycle step.
     function upkeepStep(address caller) external {
-        if (!(msg.sender == pad)) revert PadErrors.PadNotPad();
+        _onlyPad();
         if (locked || entrants.length == 0) return;
         locked = true;
         _draw(DRAW_BATCH, caller);
@@ -398,7 +398,7 @@ contract PadGame {
     /// income: it is paid out only to a game with >= 5 living Imps, capped at 3x the roll-earned pot,
     /// and otherwise returns to the carry pot at the end.
     function fundPot() external payable {
-        if (!(msg.sender == pad)) revert PadErrors.PadNotPad();
+        _onlyPad();
         if (!(!finalized)) revert PadErrors.PadFinalized();
         pot += msg.value;
         fundedPot += msg.value;
@@ -444,7 +444,7 @@ contract PadGame {
     function status() external view returns (uint8) {
         if (failed) return 6;
         if (graduated) return 5;
-        if (finalized) return ethRaised == 0 || IPadLiquidity(liquidity).canGraduate(address(this)) ? 4 : 8;
+        if (finalized) return ethRaised == 0 || _canGraduate() ? 4 : 8;
         if (entrants.length == 0) return 0;
         if (block.timestamp < signupEnd()) return 1;
         if (!drawComplete) return 7;
@@ -664,6 +664,10 @@ contract PadGame {
         }
         finalized = true;
         finalizedAt = uint64(block.timestamp);
+        // Anchor the conversion price before the chunks become predictable; a dead venue is no blocker.
+        if (ethRaised != 0) {
+            try IPadLiquidity(liquidity).observe{gas: 80_000}(launchId) {} catch {}
+        }
         uint256 p = pot;
         uint256 funded = fundedPot;
         uint256 earned = p - funded - bailPot;
@@ -760,6 +764,34 @@ contract PadGame {
         }
     }
 
+    function _fundBurn(uint256 amount) internal {
+        IPadLiquidity(liquidity).fundBurn{value: amount}();
+    }
+
+    function _balance(address who) internal view returns (uint256) {
+        return IPadToken(token).balanceOf(who);
+    }
+
+    function _onlyPad() internal view {
+        if (!(msg.sender == pad)) revert PadErrors.PadNotPad();
+    }
+
+    function _notOver() internal view {
+        if (!(!ended())) revert PadErrors.PadGameOver();
+    }
+
+    function _upkeep() internal {
+        IPvPPad(pad).upkeepFor(msg.sender);
+    }
+
+    function _requireOpen() internal view {
+        if (!(IPvPPad(pad).opened())) revert PadErrors.PadPadNotOpen();
+    }
+
+    function _canGraduate() internal view returns (bool) {
+        return IPadLiquidity(liquidity).canGraduate(address(this));
+    }
+
     function _pay(address to, uint256 amount) internal {
         if (amount == 0) return;
         bool ok = PadLib.push(to, amount);
@@ -771,10 +803,10 @@ contract PadGame {
         if (!finalized || graduated) return false;
         if (ethRaised != 0) {
             _prepareConversion();
-            if (!IPadLiquidity(liquidity).canGraduate(address(this))) return false;
+            if (!_canGraduate()) return false;
         }
         graduated = true;
-        uint256 bal = IPadToken(token).balanceOf(address(this));
+        uint256 bal = _balance(address(this));
         if (ethRaised == 0) {
             failed = true;
             if (bal != 0) if (!(IPadToken(token).transfer(DEAD, bal))) revert PadErrors.PadBurn();

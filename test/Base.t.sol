@@ -210,7 +210,11 @@ abstract contract BaseTest is Test {
     // V4ConversionTest separately seeds a real IMD/ETH pool and exercises normal conversion.
     function graduateGame(PadGame g) internal {
         if (g.finalized() && !g.graduated() && g.ethRaised() != 0) {
-            uint256 deadline = uint256(g.finalizedAt()) + 24 hours;
+            // The stall clock starts with the escrow, not at finalization.
+            (,,,,, bool started,) = liq.conversions(address(g));
+            if (!started) g.prepareConversion();
+            (,,,, uint64 progress,,) = liq.conversions(address(g));
+            uint256 deadline = uint256(progress) + 24 hours;
             if (vm.getBlockTimestamp() < deadline) vm.warp(deadline);
         }
         g.graduate();

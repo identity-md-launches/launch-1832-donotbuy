@@ -7,7 +7,7 @@ import {PadGame} from "../src/PadGame.sol";
 import {PadToken} from "../src/PadToken.sol";
 import {PadLiquidity} from "../src/PadLiquidity.sol";
 import {PadLib} from "../src/libs/PadLib.sol";
-import {PoolKey, IPoolManager} from "../src/interfaces/Interfaces.sol";
+import {PoolKey, IPoolManager, IUnlockCallback} from "../src/interfaces/Interfaces.sol";
 import {V4Router} from "./RealV4.sol";
 import {Rejector} from "./mocks/Mocks.sol";
 
@@ -25,6 +25,41 @@ contract TestIMD {
         balanceOf[msg.sender] -= amount;
         balanceOf[to] += amount;
         return true;
+    }
+}
+
+/// @dev Same balance logic and storage layout as TestIMD, but `transfer` returns nothing (USDT style).
+contract NoReturnIMD {
+    mapping(address => uint256) public balanceOf;
+    uint256 public totalSupply;
+
+    function transfer(address to, uint256 amount) external {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+    }
+}
+
+/// @dev Calls convertChunk from inside its own PoolManager unlock (finding d74f26e2).
+contract NestedConverter is IUnlockCallback {
+    IPoolManager immutable pm;
+    PadLiquidity immutable liq;
+    bytes public reason;
+
+    constructor(IPoolManager pm_, PadLiquidity liq_) {
+        pm = pm_;
+        liq = liq_;
+    }
+
+    function run(address game) external {
+        pm.unlock(abi.encode(game));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        try liq.convertChunk(abi.decode(data, (address))) {}
+        catch (bytes memory r) {
+            reason = r;
+        }
+        return "";
     }
 }
 
@@ -396,10 +431,14 @@ contract V4PadTest is BaseTest {
         uint256 front = bound(input, 0.0001 ether, 60 ether);
         V4Router attacker = new V4Router(pm);
         vm.deal(address(attacker), front);
+        uint256 moved = managerPrice(imdKey);
         attacker.trade(imdKey, true, front);
+        moved = managerPrice(imdKey) * 10_000 / moved;
         liq.convertChunk(address(pvp));
         (, uint256 converted,,,,,) = liq.conversions(address(pvp));
-        assertGt(converted, 0);
+        // Inside the anchor band the chunk fills; a front-run past it is refused outright.
+        if (moved > 9_901) assertGt(converted, 0);
+        if (moved < 9_899) assertEq(converted, 0);
         attacker.trade(imdKey, false, imd.balanceOf(address(attacker)));
         assertLt(address(attacker).balance, front, "front/victim/back round trip loses both venue fees");
     }
@@ -704,7 +743,7 @@ contract V4PadTest is BaseTest {
         vm.expectRevert(abi.encodeWithSignature("PadNotConverting()"));
         liq.convertChunk(address(pvp));
         vm.expectRevert(abi.encodeWithSignature("PadNotSelf()"));
-        liq.executeConversion(1);
+        liq.executeConversion(1, 1);
         vm.expectRevert(abi.encodeWithSignature("PadNotPoolManager()"));
         liq.unlockCallback("");
         vm.deal(address(this), 1 ether);
@@ -784,6 +823,166 @@ contract V4PadTest is BaseTest {
         assertGt(gotB, 0);
         assertEq(liq.totalConversionEth(), leftA + leftB);
         assertEq(liq.totalConversionIMD(), gotA + gotB);
+        _assertEscrow();
+    }
+
+    // ---- revision: anchored band, nested unlock, progress floor, stall clock, no-return IMD -------
+
+    function _sumConverted(uint256 n) internal returns (uint256 converted) {
+        for (uint256 i; i < n; ++i) {
+            try liq.convertChunk(address(pvp)) {} catch {}
+            (uint256 left, uint256 c,,,,,) = liq.conversions(address(pvp));
+            converted = c;
+            if (left == 0) return converted;
+            vm.warp(vm.getBlockTimestamp() + 30);
+        }
+    }
+
+    function test_heldFrontRunAcrossAllChunksIsRefusedAndLoses() public {
+        _largeRaise();
+        uint256 anchor = liq.anchorOf(address(pvp));
+        assertEq(anchor, managerPrice(imdKey), "finalize anchors the spot before any chunk is known");
+        V4Router attacker = new V4Router(pm);
+        vm.deal(address(attacker), 10 ether);
+        attacker.trade(imdKey, true, 10 ether);
+        // The attacker drives every chunk itself for 100 minutes: the band refuses them all.
+        assertEq(_sumConverted(200), 0, "no chunk sells into the attacker's price");
+        (,,, uint64 attempted,,,) = liq.conversions(address(pvp));
+        assertEq(attempted, 0, "refused chunks do not consume the interval");
+        attacker.trade(imdKey, false, imd.balanceOf(address(attacker)));
+        assertLt(address(attacker).balance, 10 ether, "the held position only paid both venue fees");
+        // Once the price is back the conversion completes at the fair price.
+        _convertAll(pvp);
+        (, uint256 converted, uint256 received,,,,) = liq.conversions(address(pvp));
+        assertEq(converted, pvp.ethRaised());
+        assertGt(received, converted * 97 / 100, "IMD received at roughly the pre-attack price");
+        _assertEscrow();
+    }
+
+    function test_anchorBandBoundsCumulativeWalkAndDecaysForAGenuineMove() public {
+        _largeRaise();
+        uint256 a = liq.anchorOf(address(pvp));
+        // A lasting market move of ~3% in price (1.5% sqrt) below the anchor, with no arbitrage back.
+        router.trade(imdKey, true, 1.03 ether);
+        assertLt(managerPrice(imdKey), a - a * 100 / 10_000);
+        liq.convertChunk(address(pvp));
+        (, uint256 converted,,,,,) = liq.conversions(address(pvp));
+        assertEq(converted, 0, "outside the 2% band");
+        // The anchor follows a falling market by 0.5% sqrt price per hour.
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        assertApproxEqAbs(liq.anchorOf(address(pvp)), a - a * 50 / 10_000, 1);
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        uint256 spot = managerPrice(imdKey);
+        liq.convertChunk(address(pvp));
+        (, converted,,,,,) = liq.conversions(address(pvp));
+        assertGt(converted, 0, "after the decay the band reaches the new market");
+        uint256 floor = liq.anchorOf(address(pvp));
+        floor -= floor * 100 / 10_000;
+        assertGe(managerPrice(imdKey), floor, "never below the band");
+        assertGe(managerPrice(imdKey), spot - spot * 50 / 10_000, "never more than 1% from spot");
+        _assertEscrow();
+    }
+
+    function test_nestedUnlockCallerIsRejectedAndHonestChunkConverts() public {
+        _largeRaise();
+        pvp.prepareConversion();
+        NestedConverter nested = new NestedConverter(pm, liq);
+        nested.run(address(pvp));
+        assertEq(nested.reason(), abi.encodeWithSignature("PadManagerUnlocked()"));
+        (,,, uint64 attempted,,,) = liq.conversions(address(pvp));
+        assertEq(attempted, 0);
+        liq.convertChunk(address(pvp));
+        (, uint256 converted,,,,,) = liq.conversions(address(pvp));
+        assertGt(converted, 0, "the honest chunk in the same window converts");
+    }
+
+    function test_failedVenueAttemptDoesNotConsumeInterval() public {
+        _largeRaise();
+        pvp.prepareConversion();
+        vm.mockCallRevert(address(pm), abi.encodeWithSelector(IPoolManager.swap.selector, imdKey), bytes("down"));
+        liq.convertChunk(address(pvp));
+        vm.clearMockedCalls();
+        (, uint256 converted,, uint64 attempted,,,) = liq.conversions(address(pvp));
+        assertEq(converted, 0);
+        assertEq(attempted, 0);
+        liq.convertChunk(address(pvp));
+        (, converted,, attempted,,,) = liq.conversions(address(pvp));
+        assertGt(converted, 0);
+        assertEq(attempted, vm.getBlockTimestamp());
+    }
+
+    function test_dustFillsDoNotRefreshTheStallClock() public {
+        _largeRaise();
+        router.remove(imdKey, 68 ether);
+        router.add(imdKey, 1e6);
+        liq.convertChunk(address(pvp));
+        (,,,, uint64 start,,) = liq.conversions(address(pvp));
+        assertEq(start, vm.getBlockTimestamp());
+        vm.warp(uint256(start) + 23 hours);
+        liq.convertChunk(address(pvp));
+        (uint256 left, uint256 converted, uint256 received,, uint64 progress,,) = liq.conversions(address(pvp));
+        assertGt(converted, 0, "dust did fill");
+        assertGt(received, 0);
+        assertLt(converted * 1000, left + converted, "below the 0.1% floor");
+        assertEq(progress, start, "dust is not progress");
+        vm.warp(uint256(start) + 24 hours - 1);
+        assertFalse(liq.canGraduate(address(pvp)));
+        vm.warp(uint256(start) + 24 hours);
+        assertTrue(liq.canGraduate(address(pvp)));
+        uint256 carry = pad.carryPot();
+        pvp.graduate();
+        assertTrue(liq.imdPool(address(pvpToken)), "graduates with the IMD converted so far");
+        assertEq(pad.carryPot() - carry, left, "unconverted ETH carried");
+        assertTrue(pvpToken.unlocked());
+        _assertEscrow();
+    }
+
+    function test_realProgressAboveFloorRefreshesClockButSevenDayCapBounds() public {
+        _largeRaise();
+        router.remove(imdKey, 68 ether);
+        router.add(imdKey, 0.2 ether); // ~0.001 ETH per 1% chunk: above the 0.1% floor, far from done
+        liq.convertChunk(address(pvp));
+        (,,,, uint64 start,,) = liq.conversions(address(pvp));
+        for (uint256 d = 1; d < 7; ++d) {
+            vm.warp(uint256(start) + d * 23 hours);
+            liq.convertChunk(address(pvp));
+            (uint256 left,,,, uint64 progress,,) = liq.conversions(address(pvp));
+            assertGt(left, 0);
+            assertEq(progress, vm.getBlockTimestamp(), "real progress refreshes the clock");
+            assertFalse(liq.canGraduate(address(pvp)));
+        }
+        vm.warp(uint256(start) + 7 days);
+        assertTrue(liq.canGraduate(address(pvp)), "never stranded: seven days from the escrow at most");
+        pvp.graduate();
+        assertTrue(liq.imdPool(address(pvpToken)));
+        _assertEscrow();
+    }
+
+    function test_untouchedGameStartsItsClockOnFirstTouchAndGraduatesIntoIMD() public {
+        _start(1);
+        rollAs(pvp, players[0]);
+        _finish();
+        (,,,,, bool started,) = liq.conversions(address(pvp));
+        assertFalse(started);
+        vm.warp(uint256(pvp.finalizedAt()) + 3 days);
+        pvp.poke();
+        assertTrue(pvp.graduated());
+        assertTrue(liq.imdPool(address(pvpToken)), "a healthy venue is used, however late the first touch");
+        (, uint256 converted, uint256 received,,,,) = liq.conversions(address(pvp));
+        assertEq(converted, pvp.ethRaised());
+        assertGt(received, 0);
+    }
+
+    function test_noReturnIMDStillSettlesGraduationBurnAndFees() public {
+        vm.etch(IMD, address(new NoReturnIMD()).code);
+        _oneRollGraduation();
+        assertTrue(liq.imdPool(address(pvpToken)));
+        assertTrue(pvpToken.unlocked());
+        vm.deal(address(this), 1 ether);
+        liq.fundBurn{value: 0.02 ether}();
+        vm.warp(vm.getBlockTimestamp() + 10 minutes);
+        liq.burnChunk();
+        assertGt(liq.totalBurnedEth(), 0);
         _assertEscrow();
     }
 }

@@ -105,6 +105,7 @@ interface IPvPPad {
 interface IPadLiquidity {
     function startConversion(uint256 launchId, uint64 finalizedAt) external payable;
     function convertChunk(address game) external;
+    function observe(uint256 launchId) external;
     function canGraduate(address game) external view returns (bool);
     function bindKing() external;
     function deployHook(bytes32 salt) external returns (address);

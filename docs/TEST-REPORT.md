@@ -3,8 +3,8 @@
 Local offline verification on 2026-10-15 with Foundry 1.8.3 and Solidity 0.8.26. Settings:
 Cancun, via-IR, optimizer **1**, `bytecode_hash = "none"`, `cbor_metadata = false`.
 
-**219 tests passed, zero failed, zero skipped, across 22 suites.** This includes all 193 inherited
-v3 tests and 26 new v4 tests. The complete run used the assignment's seed, also pinned in
+**227 tests passed, zero failed, zero skipped, across 22 suites** (plus the four reviewer proofs). This includes all 193 inherited
+v3 tests and 34 v4 tests (8 added in the revision). The complete run used the assignment's seed, also pinned in
 `foundry.toml`:
 
 ```sh
@@ -47,15 +47,26 @@ prepared conversion escrows. The actual v3 behavior assertions remain. No assert
 successful mocked PoolManager swap or substituted pool math. Explicit venue failures and selected
 ranking fixtures are used only where stated by the tests.
 
+## Revision (findings f2032eaa, d74f26e2, 0183622a, ff0950e5, 1c54845c)
+
+New tests in `test/V4Pad.t.sol` on the real v4-core PoolManager: held front-run across every chunk
+is refused and loses; anchor band bounds the cumulative walk and decays for a genuine move; a
+caller inside a PoolManager unlock is rejected and the honest chunk converts; a failed venue
+attempt does not use the interval; dust fills do not refresh the stall clock; real progress above
+the 0.1% floor refreshes it and the 7-day cap bounds it; an untouched game starts its clock on
+first touch and graduates into coin/IMD; a no-return IMD still settles graduation and the two-hop
+burn. The four reviewer proofs pass unchanged. Full run: 26 suites, 231 tests, 0 failed (the
+count includes the four proofs run from test/scratch), fuzz seed pinned in foundry.toml.
+
 ## Gas measurements
 
 | Operation | Local gas |
 |---|---:|
-| Atomic raw-CREATE2 manifest, including calldata/intrinsic and probe accounting overhead | **12,221,065** |
-| Later `openPad`, including hook and genesis clones, calldata/intrinsic | **774,342** |
-| Combined deployment and later opening | **12,995,407** |
-| Conversion upkeep on a partially filled game | 451,623 |
-| Direct two-hop burn, thin PVP pool | 283,960 |
+| Atomic raw-CREATE2 manifest, including calldata/intrinsic and probe accounting overhead | **12,189,237** |
+| Later `openPad`, including hook and genesis clones, calldata/intrinsic | **774,386** |
+| Combined deployment and later opening | **12,963,623** |
+| Conversion upkeep on a partially filled game | 502,982 |
+| Direct two-hop burn, thin PVP pool | 284,553 |
 | Crown transition, 16 real pools, both currencies, outgoing king exhausts ETH pushes | 4,795,428 |
 | Crown transition, 18 real pools | 2,829,928 |
 | Crown transition, 60 real pools fully settled | 7,804,512 |

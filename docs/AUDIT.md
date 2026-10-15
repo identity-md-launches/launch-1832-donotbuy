@@ -57,7 +57,11 @@ broadcast, RPC, fork, wallet, environment-reading test, or outside constructor c
    Tests estimate gas locally with snapshot/replay (no RPC) and exercise a subcall burning its
    entire stipend. Upkeep is best effort, so keepers must monitor unfinished lifecycle work.
 4. **Genesis failure remains recoverable, with paid griefing.** A failed genesis requires its
-   draw to finish and no roll before all Imps die. `restartGenesis` and `launch` recover it.
+   draw to finish and **zero net curve ETH** at the end: no roll before all Imps die, or every
+   roll's coins sold back by bail-outs (a sole roller's full bail-out returns exactly its curve
+   cost, so `ethRaised` returns to 0; revision finding a5b159e5). `restartGenesis` and `launch`
+   recover it. Such a griefer still pays its entry, the non-curve 10% of each roll and gas; the
+   other entrants' entries stay in the burn bucket and a restarted genesis costs them a new entry.
    The first entry's 0.001 ETH is now the draw bounty, so a sole entrant who captures its own seed
    can recover that fee (gas remains spent); subsequent entries still burn. This weakens the v2
    solo-entry grief cost intentionally under Fix 4. The uncapped entry list prevents speed-based
@@ -132,6 +136,17 @@ broadcast, RPC, fork, wallet, environment-reading test, or outside constructor c
     remaining margin is about **0.0355 ETH**, before charging any entry costs, burn, pool fees or gas.
     Real fees make the tested attack less profitable. This proof also credits coin LP fees back to
     the sybil; the old fee-dependent 0.99 bound was unnecessarily optimistic about fee leakage.
+
+    The fair `I = B*e/(A+e)` assumes nobody holds the venue away from its price across the chunks.
+    Since revision f2032eaa, a chunk never sells below the game's anchor (spot recorded at
+    finalization, raised by any better spot seen at a chunk, decaying 0.5% sqrt / ~1% price per
+    hour) minus 1% sqrt (~2% price). A position held across all chunks therefore cannot make the
+    game buy more than ~2% (plus elapsed decay) below the finalize-time price, and the sybil, who
+    would be the one moving the venue, gains at most that same fraction of I while paying both
+    venue fees on its position. The 15.89% bound above becomes at least ~13.9% of e only if the
+    sybil also holds the venue 2% away for the whole conversion with no arbitrage, against the
+    funded rebate of 15% minus its own two 1% venue fees on a position worth at least 2% of A;
+    `test_soleBuyerSybilWithProfitableBailAndFiveSurvivorsStillLosesAfterTwoHopDump` remains green.
 
     With a partial conversion E <= e, LP coins are `E/P`, where `P = (1+e)^2/VTOK`, and the coin
     dump fraction is at most `e*(1+e)/(E+e*(1+e))`. Apply that fraction to the IMD obtained with E;
@@ -320,12 +335,16 @@ broadcast, RPC, fork, wallet, environment-reading test, or outside constructor c
     progress timestamps. IMD balances are credited only from successful PoolManager deltas; direct
     donations are ignored. The whole swap is inside a gas-capped self-call, so a revert, malformed
     result, zero output for positive input, or exhausted stipend rolls back all deltas. Failed/zero
-    progress attempts never extend the deadline. A gas floor before writing lastAttempt prevents
-    deliberate underfunding from consuming the interval. Upkeep retains its v3 outer game cap and
+    progress attempts never extend the deadline. A gas floor prevents deliberate underfunding,
+    `lastAttempt` is written only after the venue unlock returned, and a caller inside a
+    PoolManager unlock is rejected with `PadManagerUnlocked` (revision d74f26e2), so failed or
+    out-of-band attempts never consume the 30-second interval. Upkeep retains its v3 outer game cap and
     uses 500k for conversion, with a 350k isolated venue call; direct calls remain available.
 33. **Graduation and timeout.** Normal conversion spends at most to sqrt factor 0.995 from spot,
-    strictly less than 1% price movement, once per 30 seconds per game. Graduation cannot bypass
-    unfinished conversion until 24 hours since finalization or the last successful progress.
+    strictly less than 1% price movement, once per 30 seconds per game, and never below the anchor
+    band (see 37). Graduation cannot bypass unfinished conversion until 24 hours since the escrow
+    was created or the last stamp of real progress (at least 0.1% of the escrow converted since the
+    previous stamp), or 7 days after the escrow at most.
     Partial success seeds the IMD pool and carries the rest of ETH; no IMD success seeds the native
     v3 pool. Both paths unlock atomically only after actual LP settlement, burn excess launch coins,
     and preserve permanent full-range LP ownership. An overflow-safe sqrt-ratio encoding supports
@@ -361,6 +380,36 @@ broadcast, RPC, fork, wallet, environment-reading test, or outside constructor c
     Regression tests reject IDs for changed currencies, fee, tick spacing or hooks, a zero ID,
     and an IMD/key mismatch. Atomic deployment tests use the literal supplied ID and assert the
     reconstructed key matches it without external code. Runtime pool behavior is unchanged.
+
+37. **Revision: conversion anchor, stall clock and dust (findings f2032eaa, d74f26e2, 0183622a,
+    ff0950e5, 1c54845c).**
+    - *Held front-run / dominant LP.* The 1% band was relative to a spot the caller can set. Now
+      `_finalize` calls `PadLiquidity.observe(launchId)` (registered game only, gas-capped, a dead
+      venue does not block finalization) to record the IMD/ETH spot as the game's anchor before the
+      chunks are scheduled. Each chunk's limit is `max(0.995 * spot, 0.99 * anchor)` in sqrt price;
+      if spot is already below it the chunk is skipped (`ConversionStalled`, no interval used). The
+      anchor rises to any higher spot seen at a chunk (that chunk then sells at the better price)
+      and decays linearly by 0.5% sqrt per hour so a genuine market move is followed within hours.
+      `anchorOf(game)` is the view. Residual risk: whoever front-runs `finalize` itself sets the
+      anchor and must then hold the position against arbitrage for the whole conversion; a
+      conversion larger than ~2% of the venue's depth progresses only as fast as arbitrage or the
+      decay allows, and the game's cumulative impact is bounded by 2% plus elapsed decay.
+      Raising the anchor costs the griefer both venue fees and sells the game IMD cheaply; it delays
+      chunks only by the decay time. Tested: `test_heldFrontRunAcrossAllChunksIsRefusedAndLoses`,
+      `test_anchorBandBoundsCumulativeWalkAndDecaysForAGenuineMove`, the sandwich fuzz.
+    - *Nested unlock.* See 32. Tested: `test_nestedUnlockCallerIsRejectedAndHonestChunkConverts`,
+      `test_failedVenueAttemptDoesNotConsumeInterval`.
+    - *Dust progress.* A fill refreshes `lastProgress` only when the ETH converted since the last
+      stamp reaches 1/1000 of the escrow, or completes it; `CONVERT_MAX_DURATION = 7 days` from the
+      escrow bounds any conversion. Tested: `test_dustFillsDoNotRefreshTheStallClock`,
+      `test_realProgressAboveFloorRefreshesClockButSevenDayCapBounds`.
+    - *Stall clock.* `startConversion` stamps `lastProgress = block.timestamp`, so a game nobody
+      touched for a day still gets a real conversion attempt on a healthy venue before the native
+      fallback can apply. Tested: `test_untouchedGameStartsItsClockOnFirstTouchAndGraduatesIntoIMD`.
+    - *IMD without a bool return.* Token settlement and IMD fee payment accept `true` or an empty
+      return. Tested: `test_noReturnIMDStillSettlesGraduationBurnAndFees`.
+    - Deployment gas stays under the 13M target: repeated external-call and check sequences were
+      folded into internal helpers (no behaviour change) to pay for the new code.
 
 ## Edges covered by tests and known gaps
 

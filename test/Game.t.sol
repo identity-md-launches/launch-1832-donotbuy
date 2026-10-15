@@ -513,7 +513,12 @@ contract GameTest is BaseTest {
         // a state-changing call elsewhere (pad.upkeep) finalizes and, on the next call, graduates
         pad.upkeep();
         assertTrue(pvp.finalized());
-        vm.warp(uint256(pvp.finalizedAt()) + 24 hours);
+        // the next upkeep escrows the curve ETH and starts the 24 h stall clock (no IMD venue here)
+        pad.upkeep();
+        assertFalse(pvp.graduated());
+        (,,,, uint64 progress, bool started,) = liq.conversions(address(pvp));
+        assertTrue(started);
+        vm.warp(uint256(progress) + 24 hours);
         pad.upkeep();
         assertTrue(pvp.graduated());
     }

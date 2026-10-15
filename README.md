@@ -81,8 +81,10 @@ and later-opening gas and the limits of the factory rehearsal.
 6. Run `PadLiquidity.convertChunk(game)` after finalization, with at least 30 seconds between
    attempts per game. It automatically escrows that game's net curve ETH once. Monitor
    `conversions(game)`, `ConversionProgress`, `ConversionStalled` and `canGraduate(game)`; call
-   `graduate()` when ready. A failed attempt does not move the 24-hour no-progress deadline.
-   The deadline starts at finalization, so an absent keeper does not add another day on first use.
+   `graduate()` when ready. A failed attempt does not move the 24-hour no-progress deadline and
+   does not use the 30-second interval. The deadline starts when the escrow is created, so the
+   first late touch still tries the venue before any fallback. Watch `anchorOf(game)` against the
+   venue spot: a chunk only fills within ~2% (price) of it.
    Upkeep attempts conversion and graduation, but explicit calls remain necessary if gas is scarce.
 
 There are no oracle subscriptions, secret keys, backend signers, additional settings or operator
@@ -150,7 +152,12 @@ draw inside the same transaction cannot capture the remainder. Donations and bai
 
 After finalization, curve ETH is escrowed separately for each game in PadLiquidity. Each
 `convertChunk(game)` uses its own funds in one PoolManager unlock, with a spot-relative limit
-of `sqrtPrice * 0.995` (less than 1% in price). A chunk can spend only to that limit; remaining
+of `sqrtPrice * 0.995` (less than 1% in price), and never below the game's anchor band:
+`0.99 * anchor` in sqrt price (~2% in price), where the anchor is the IMD/ETH spot recorded at
+finalization, raised by any better spot seen at a chunk and decaying by 0.5% sqrt price per hour
+(`anchorOf(game)`). A chunk with spot already below the band is skipped without using the
+interval, so a position held across all chunks cannot walk the game's price. A conversion bigger
+than ~2% of the venue's depth advances as fast as arbitrage or the decay allows. A chunk can spend only to that limit; remaining
 ETH stays in the game's escrow for the next attempt, at least 30 seconds later. Missing, empty,
 failing or gas-hungry pools leave the escrow intact. A deliberately underfunded call cannot consume
 the interval. Unsolicited IMD or ETH never increases a game's credited amounts.
@@ -162,7 +169,10 @@ remain ±887200. PadLiquidity owns LP forever, with no removal path. The 1 ppm l
 protects settlement rounding. Excess launch coins go to dEaD, and the token unlocks in that
 transaction. `poolKey(token)` describes the established route after graduation.
 
-After **24 hours without conversion progress**, `graduate()` uses partial IMD, sends unconverted
+Progress means at least 1/1000 of the escrow converted since the last progress stamp (dust fills
+do not count). The clock starts when the escrow is created (first `convertChunk`, `poke`, upkeep or
+`graduate` after finalization), not at finalization, and any conversion ends at most 7 days after
+its escrow was created. After **24 hours without conversion progress**, `graduate()` uses partial IMD, sends unconverted
 ETH to carry, and unlocks. If no IMD was obtained, the same timeout permits the v3 coin/ETH
 full-range pool at the final curve price. A zero-net-curve game fails and burns remaining supply,
 including a game whose buyers all bailed out; failed genesis remains restartable. No administrator
@@ -217,7 +227,7 @@ route, since there is no PVP/IMD pool. Spot-relative limits bound each swap's im
 | Collection health probe | Whole 300k stipend + 100k reserve required |
 | Pad game upkeep step | 4.5M per call; latest entered game plus one older round-robin game |
 | Pad distribute(2) / burnChunk | 750k / 350k |
-| Conversion | 500k upkeep call, 350k isolated swap; 30s/game; 24h no-progress fallback |
+| Conversion | 500k upkeep call, 350k isolated swap; 30s/game; 1% from spot and >= 0.99 x anchor (sqrt), anchor decays 0.5%/h (`ANCHOR_BAND_BPS`, `ANCHOR_DECAY_BPS_PER_HOUR`); 24h without 0.1% progress (`PROGRESS_FLOOR_DIVISOR`) or 7 days (`CONVERT_MAX_DURATION`) fallback |
 | Pad reserve | 100k plus cap/63 before each subcall; return immediately below 150k |
 | ETH pushes | 30k; rejected push becomes claimable |
 | King funding window | Last 10 entered games; eligibility threshold 5 |

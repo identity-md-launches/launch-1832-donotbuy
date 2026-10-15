@@ -92,7 +92,8 @@ contract PvPPad {
         emit KingBound(msg.sender);
     }
 
-    /// @notice A genesis game that ended without a single roll is marked failed and its token burned.
+    /// @notice A genesis game that ended with no net curve ETH (no roll, or every roll's coins bailed
+    /// out back to the curve) is marked failed and its token burned.
     /// Anyone may then relaunch PvP so the pad is never locked: the new launch becomes the genesis
     /// that other launches, the king and the burn wait for. `launch()` does the same when it finds
     /// the genesis failed.
@@ -160,7 +161,7 @@ contract PvPPad {
     /// @notice A game reports its first paid entry once. Only entered launches take part in upkeep
     /// and in the king's last-10 window, so a free launch nobody enters cannot crowd them out.
     function noteFirstEntry(uint256 id) external {
-        if (!(launches[id - 1].game == msg.sender)) revert PadErrors.PadNotGame();
+        _onlyGame(id);
         entered.push(id);
         emit SignupStarted(id);
     }
@@ -175,7 +176,7 @@ contract PvPPad {
     /// @notice A registered game pulls only its unused funded-release allowance at finalization.
     /// The immutable game computes the allowance after counting at least five living Imps.
     function takeCarry(uint256 id, uint256 maxAmount) external {
-        if (!(launches[id - 1].game == msg.sender)) revert PadErrors.PadNotGame();
+        _onlyGame(id);
         uint256 carry = carryPot < maxAmount ? carryPot : maxAmount;
         if (carry == 0) return;
         carryPot -= carry;
@@ -277,6 +278,10 @@ contract PvPPad {
     function genesisFailed() public view returns (bool) {
         if (genesisId == 0) return false;
         return IPadGame(launches[genesisId - 1].game).failed();
+    }
+
+    function _onlyGame(uint256 id) internal view {
+        if (!(launches[id - 1].game == msg.sender)) revert PadErrors.PadNotGame();
     }
 
     function launchCount() external view returns (uint256) {
