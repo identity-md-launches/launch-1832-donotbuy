@@ -1,0 +1,39 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "PadToken",
+      "constructorArgs": []
+    },
+    {
+      "contract": "PadGame",
+      "constructorArgs": []
+    },
+    {
+      "contract": "PvPPad",
+      "constructorArgs": [
+        "$owner",
+        "$contract:PadToken",
+        "$contract:PadGame"
+      ]
+    },
+    {
+      "contract": "PadLiquidity",
+      "constructorArgs": [
+        "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+        "$contract:PvPPad",
+        "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127",
+        "0xd2fc01ee6f8400b6b4ea3b341a188568f2bd6c72b07b96741a82396fa6eb8f02"
+      ]
+    },
+    {
+      "contract": "KingOfThePad",
+      "constructorArgs": [
+        "$contract:PvPPad",
+        "$contract:PadLiquidity",
+        "0x5b95a971b4583a5f011e9da082acdd679b870d06"
+      ]
+    }
+  ],
+  "notes": "PvP Pad v4 on Robinhood Chain (4663), fresh from launch 1764 at c3a2fac8312fac1dabbd8deca78a987e180523c8. Deploy these five applications atomically, in dependency order, with zero ETH. No deployment token, supply, name, symbol, game clone, hook, pool or distributor; PadToken and PadGame are sealed templates. Every token, including PVP, is created later by PvPPad. Owner is $owner; KingOfThePad dev recipient is the explicitly specified 0x5b95a971b4583a5f011e9da082acdd679b870d06. PadLiquidity takes (poolManager, pad, imd, imdEthPoolId), four static string arguments. The bytes32 PoolId commits to the full native ETH/IMD key: currency0=native ETH, currency1=IMD, fee=10000, tickSpacing=100, no hooks. The constructor reconstructs this fixed key from IMD and rejects an unequal PoolId before binding to the pad; native ETH and no hooks are protocol constants, with no zero-address manifest arguments. The PoolId is 0xd2fc01ee6f8400b6b4ea3b341a188568f2bd6c72b07b96741a82396fa6eb8f02. The inherited PoolManager address is 0x8366a39cc670b4001a1121b8f6a443a643e40951; no RPC was called to attest live code. Constructors are static, nonpayable and call only earlier manifest applications for one-shot bindings; no post-deployment configuration call is needed. The pad remains closed; later openPad(salt), by the owner or anyone after 30 days, deploys the permission-bit-mined PadHook and genesis clones. PadHook is deliberately absent from this manifest. During play, bailOut(minOut) sells all player coins back to the curve and erases the seat. Bail taxes do not lift rollPot; funded release remains min(3x roll income, 15% net curve ETH), with five living non-erased seats required. After finalize, public and bounded-upkeep convertChunk(game) converts net curve ETH to plain ERC20 IMD in spot-relative price-limited chunks, once per 30 seconds/game. Graduation creates a sorted coin/IMD pool at the equivalent final curve price, fee 10000, spacing 200, PadHook, full-range permanent PadLiquidity-owned LP; coins unlock atomically and excess coins go to dEaD. After 24 hours without progress, partial IMD seeds the pool and remaining ETH goes to carry; zero IMD uses the v3 native coin/ETH pool. Burn buys use ETH to IMD to PVP in one unlock, each hop bounded to at most 1% price impact, 0.02 ETH per ten minutes; the explicitly native genesis fallback retains native buys. IMD intermediate balances and conversion escrows are internally accounted. Raffle, tips, carry rules, crown settlement, broken-pool handling and reign stamps are retained; king fees are paid in kind. See docs/AUDIT.md, docs/TEST-REPORT.md and docs/VERIFY.md. Independent audit and legal review are required before public launch. This assignment never deploys, broadcasts or calls RPCs."
+}
